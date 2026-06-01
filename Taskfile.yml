@@ -1,0 +1,18 @@
+version: "3"
+
+tasks:
+  build:
+    desc: 编译项目
+    cmds:
+      - go build -o show-me-the-story.exe .
+
+  dev:
+    desc: 编译并启动开发服务器
+    deps: [build]
+    cmds:
+      - ./show-me-the-story.exe
+
+  clean:
+    desc: 清理编译产物
+    cmds:
+      - Remove-Item -Force -ErrorAction SilentlyContinue show-me-the-story.exe
