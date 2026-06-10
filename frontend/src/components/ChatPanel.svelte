@@ -1,7 +1,7 @@
 <script>
   import { onMount, afterUpdate } from 'svelte';
   import { api } from '../lib/api.js';
-  import { chatSessions, currentChatSession, addToast, showConfirm, taskRunning, lastFailedTask } from '../lib/stores.js';
+  import { chatSessions, currentChatSession, addToast, showConfirm, taskRunning, lastFailedTask, logEntries, currentTaskName } from '../lib/stores.js';
 
   export let contextPage = 'config';
 
@@ -13,6 +13,8 @@
   $: msgs = ($currentChatSession?.messages || []);
   $: streamingText = $currentChatSession?.streaming_text || '';
   $: pendingTools = $currentChatSession?.pending_tool_calls || [];
+  $: taskLogs = ($logEntries || []).slice(-20);
+  let taskStatusCollapsed = false;
 
   // 重试 API 端点映射
   const retryEndpoints = {
@@ -24,6 +26,18 @@
     'continuation_outline': { method: 'POST', url: '/api/outline/generate-continuation' },
     'settings_reconciliation': { method: 'POST', url: '/api/settings/reconcile' },
   };
+
+  function isHallucinatedWait(msg, allMsgs, idx) {
+    if (msg.role !== 'assistant' || !msg.content) return false;
+    if (msg.tool_calls?.length > 0) return false;
+    const waitPattern = /请(耐心)?等待|请稍等|正在生成|等待完成/;
+    if (!waitPattern.test(msg.content)) return false;
+    for (let i = idx - 1; i >= 0; i--) {
+      if (allMsgs[i].role === 'user') break;
+      if (allMsgs[i].role === 'assistant' && allMsgs[i].tool_calls?.length > 0) return false;
+    }
+    return true;
+  }
 
   function parseContentSegments(text) {
     if (!text) return [{ type: 'text', content: '' }];
@@ -206,12 +220,37 @@
     </div>
   {/if}
 
+  <!-- Task Status -->
+  {#if $taskRunning || taskLogs.length > 0}
+    <div class="border-b border-base-content/10 shrink-0">
+      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
+      <div class="flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-base-300/50" on:click={() => taskStatusCollapsed = !taskStatusCollapsed}>
+        {#if $taskRunning}
+          <span class="loading loading-spinner loading-xs text-warning"></span>
+        {/if}
+        <span class="text-xs font-semibold text-base-content/70">{$currentTaskName || '任务'}{$taskRunning ? ' 进行中' : ' 已结束'}</span>
+        <span class="text-xs text-base-content/40 ml-auto">{taskStatusCollapsed ? '展开' : '收起'}</span>
+      </div>
+      {#if !taskStatusCollapsed && taskLogs.length > 0}
+        <div class="max-h-[150px] overflow-y-auto px-3 py-1 font-mono text-xs leading-relaxed space-y-0.5">
+          {#each taskLogs as entry}
+            <div class="flex gap-2">
+              <span class="text-base-content/30 shrink-0">{entry.time}</span>
+              <span class={entry.level === 'error' ? 'text-error' : entry.level === 'warn' ? 'text-warning' : entry.level === 'success' ? 'text-success' : 'text-base-content/60'}>{entry.msg}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
+
   <!-- Messages -->
   <div bind:this={messagesContainer} class="flex-1 overflow-y-auto p-3 space-y-2">
     {#if !$currentChatSession}
       <div class="text-center text-base-content/40 py-8 text-base">选择或创建一个会话开始对话</div>
     {:else}
-      {#each msgs as m}
+      {#each msgs as m, msgIdx}
         {#if m.role === 'user'}
           <div class="chat chat-end">
             <div class="chat-bubble chat-bubble-primary text-sm whitespace-pre-wrap max-w-[85%]">{m.content}</div>
@@ -228,20 +267,29 @@
             {/each}
           {/if}
           {#if m.content}
-            {#each parseContentSegments(m.content) as seg}
-              {#if seg.type === 'tool_call'}
-                <div class="chat chat-start">
-                  <div class="chat-bubble bg-base-300 text-xs font-mono max-w-[85%]">
-                    <div class="text-warning font-semibold mb-0.5">🔧 {seg.name}</div>
-                    <div class="text-base-content/50 break-all">{typeof seg.args === 'string' ? seg.args : JSON.stringify(seg.args)}</div>
+            {#if isHallucinatedWait(m, msgs, msgIdx)}
+              <div class="chat chat-start">
+                <div class="chat-bubble bg-warning/20 border border-warning/40 text-sm max-w-[85%]">
+                  <div class="text-warning font-semibold mb-1">⚠️ 该回复可能未实际执行操作</div>
+                  <div class="text-base-content/70 whitespace-pre-wrap">{m.content}</div>
+                </div>
+              </div>
+            {:else}
+              {#each parseContentSegments(m.content) as seg}
+                {#if seg.type === 'tool_call'}
+                  <div class="chat chat-start">
+                    <div class="chat-bubble bg-base-300 text-xs font-mono max-w-[85%]">
+                      <div class="text-warning font-semibold mb-0.5">🔧 {seg.name}</div>
+                      <div class="text-base-content/50 break-all">{typeof seg.args === 'string' ? seg.args : JSON.stringify(seg.args)}</div>
+                    </div>
                   </div>
-                </div>
-              {:else if seg.content}
-                <div class="chat chat-start">
-                  <div class="chat-bubble bg-base-300 text-sm whitespace-pre-wrap max-w-[85%]">{seg.content}</div>
-                </div>
-              {/if}
-            {/each}
+                {:else if seg.content}
+                  <div class="chat chat-start">
+                    <div class="chat-bubble bg-base-300 text-sm whitespace-pre-wrap max-w-[85%]">{seg.content}</div>
+                  </div>
+                {/if}
+              {/each}
+            {/if}
           {/if}
         {:else if m.role === 'tool'}
           <div class="chat chat-start">

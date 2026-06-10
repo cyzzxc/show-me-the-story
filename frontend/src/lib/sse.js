@@ -1,4 +1,4 @@
-import { addLog, addToast, config, progress, taskRunning, streamingContent, streamingChapterIdx, continueAnalysis, currentChatSession, settings, taskNotification, chatSessions, lastFailedTask } from './stores.js';
+import { addLog, addToast, config, progress, taskRunning, streamingContent, streamingChapterIdx, continueAnalysis, currentChatSession, settings, taskNotification, chatSessions, lastFailedTask, currentTaskName, logEntries } from './stores.js';
 import { api } from './api.js';
 
 let eventSource = null;
@@ -22,7 +22,8 @@ export function connectSSE() {
     taskRunning.set(true);
     streamingContent.set('');
     streamingChapterIdx.set(-1);
-    // 新任务开始时清除重试信息
+    currentTaskName.set(taskNames[d.task] || d.task);
+    logEntries.set([]);
     lastFailedTask.set(null);
   });
 
@@ -43,6 +44,7 @@ export function connectSSE() {
     taskRunning.set(false);
     streamingContent.set('');
     streamingChapterIdx.set(-1);
+    currentTaskName.set(null);
     api('GET', '/api/progress').then(p => progress.set(p)).catch(() => {});
 
     if (d.success) {

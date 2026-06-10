@@ -18,7 +18,6 @@
   import Skills from './pages/Skills.svelte';
   import ChatPanel from './components/ChatPanel.svelte';
   import ConfirmModal from './components/ConfirmModal.svelte';
-  import LogPanel from './components/LogPanel.svelte';
 
   let chatPanel;
 
@@ -117,9 +116,6 @@
       </div>
     </div>
   {/if}
-
-  <!-- Log Panel -->
-  <LogPanel />
 
   <!-- Toasts -->
   <div class="fixed top-5 right-5 z-50 flex flex-col gap-2">

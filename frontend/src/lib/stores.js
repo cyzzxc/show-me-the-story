@@ -6,6 +6,7 @@ export const progress = writable(null);
 export const settings = writable(null);
 export const skills = writable([]);
 export const taskRunning = writable(false);
+export const currentTaskName = writable(null);
 
 export const currentProject = writable(null);
 export const projects = writable([]);
