@@ -5,13 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
 type Handlers struct {
-	apiCfg       *APIConfig
-	apiCfgPath   string
+	apiCfg     *APIConfig
+	apiCfgPath string
+	logger     *LogBroadcaster
+
+	// Project management
+	progDir     string
+	projectName string
+	projectMu   sync.RWMutex
+
+	// Per-project state (updated on switchProject)
 	cfg          *Config
 	cfgPath      string
 	state        *Progress
@@ -20,31 +30,105 @@ type Handlers struct {
 	settingsPath string
 	skills       []Skill
 	sessionsDir  string
-	logger       *LogBroadcaster
-	taskMu       sync.Mutex
-	taskRunning  bool
-	taskCtx      context.Context
-	taskCancel   context.CancelFunc
-	projectDir   string
+
+	// Task management
+	taskMu      sync.Mutex
+	taskRunning bool
+	activeWork  int
+	taskCtx     context.Context
+	taskCancel  context.CancelFunc
+	autoConfirm bool // 自动确认模式：章节生成完成后自动确认并继续生成下一章
 
 	pendingContinueContent string
+	lastChatMessage        string      // 缓存最后发送的聊天消息，用于重试
+	lastReconcileBody      StoryConfig // 缓存最后的设定协调请求
 }
 
-func NewHandlers(apiCfg *APIConfig, apiCfgPath string, cfg *Config, cfgPath string, state *Progress, progressPath string, settings *ProjectSettings, settingsPath string, skills []Skill, sessionsDir string, logger *LogBroadcaster, projectDir string) *Handlers {
+func NewHandlers(apiCfg *APIConfig, apiCfgPath string, logger *LogBroadcaster, progDir string) *Handlers {
 	return &Handlers{
-		apiCfg:       apiCfg,
-		apiCfgPath:   apiCfgPath,
-		cfg:          cfg,
-		cfgPath:      cfgPath,
-		state:        state,
-		progressPath: progressPath,
-		settings:     settings,
-		settingsPath: settingsPath,
-		skills:       skills,
-		sessionsDir:  sessionsDir,
-		logger:       logger,
-		projectDir:   projectDir,
+		apiCfg:     apiCfg,
+		apiCfgPath: apiCfgPath,
+		logger:     logger,
+		progDir:    progDir,
+		cfg:        DefaultConfig(),
+		state:      &Progress{Phase: "outline"},
+		settings:   &ProjectSettings{},
 	}
+}
+
+func (h *Handlers) storysDir() string {
+	return filepath.Join(h.progDir, "storys")
+}
+
+// projectDir returns the current project's directory (empty if no project selected).
+func (h *Handlers) projectDir() string {
+	h.projectMu.RLock()
+	defer h.projectMu.RUnlock()
+	if h.projectName == "" {
+		return h.progDir
+	}
+	return filepath.Join(h.progDir, "storys", h.projectName)
+}
+
+// switchProject loads all project-specific data for the given project name.
+func (h *Handlers) switchProject(name string) error {
+	h.projectMu.Lock()
+	defer h.projectMu.Unlock()
+
+	projectDir := filepath.Join(h.progDir, "storys", name)
+	if info, err := os.Stat(projectDir); err != nil || !info.IsDir() {
+		return fmt.Errorf("项目目录不存在: %s", name)
+	}
+
+	configPath := filepath.Join(projectDir, "config.json")
+	progressPath := filepath.Join(projectDir, "progress.json")
+	settingsPath := filepath.Join(projectDir, "settings.json")
+	sessionsDir := filepath.Join(projectDir, "sessions")
+	os.MkdirAll(sessionsDir, 0755)
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("加载项目配置失败: %w", err)
+	}
+
+	state, err := LoadProgress(progressPath)
+	if err != nil {
+		return fmt.Errorf("加载项目进度失败: %w", err)
+	}
+	if state == nil {
+		state = &Progress{Phase: "outline"}
+	}
+
+	settings, err := LoadProjectSettings(settingsPath)
+	if err != nil {
+		return fmt.Errorf("加载项目设定失败: %w", err)
+	}
+
+	skills := LoadAllSkills(cfg, projectDir)
+
+	h.projectName = name
+	h.cfg = cfg
+	h.cfgPath = configPath
+	h.state = state
+	h.progressPath = progressPath
+	h.settings = settings
+	h.settingsPath = settingsPath
+	h.skills = skills
+	h.sessionsDir = sessionsDir
+
+	fmt.Printf(" [系统] 已切换到项目: %s (%s)\n", name, projectDir)
+	return nil
+}
+
+// ensureProject returns true if a project is selected, otherwise writes an error response.
+func (h *Handlers) ensureProject(w http.ResponseWriter) bool {
+	h.projectMu.RLock()
+	defer h.projectMu.RUnlock()
+	if h.projectName == "" {
+		h.writeError(w, http.StatusBadRequest, "请先选择一个项目")
+		return false
+	}
+	return true
 }
 
 func (h *Handlers) writeJSON(w http.ResponseWriter, code int, v interface{}) {
@@ -60,28 +144,86 @@ func (h *Handlers) writeError(w http.ResponseWriter, code int, msg string) {
 func (h *Handlers) tryStartTask() bool {
 	h.taskMu.Lock()
 	defer h.taskMu.Unlock()
-	if h.taskRunning {
+	if h.taskRunning || h.activeWork > 0 {
 		return false
 	}
 	h.taskRunning = true
+	h.activeWork = 1
 	h.taskCtx, h.taskCancel = context.WithCancel(context.Background())
 	return true
 }
 
 func (h *Handlers) endTask() {
 	h.taskMu.Lock()
-	h.taskRunning = false
-	if h.taskCancel != nil {
-		h.taskCancel()
-		h.taskCancel = nil
+	h.activeWork--
+	if h.activeWork <= 0 {
+		h.activeWork = 0
+		h.taskRunning = false
+		if h.taskCancel != nil {
+			h.taskCancel()
+			h.taskCancel = nil
+		}
 	}
 	h.taskMu.Unlock()
+}
+
+// startChildWork 增加活跃工作计数（用于 Agent 子任务），不创建新 context
+func (h *Handlers) startChildWork() bool {
+	h.taskMu.Lock()
+	defer h.taskMu.Unlock()
+	if !h.taskRunning {
+		return false
+	}
+	h.activeWork++
+	return true
 }
 
 func (h *Handlers) isTaskRunning() bool {
 	h.taskMu.Lock()
 	defer h.taskMu.Unlock()
-	return h.taskRunning
+	return h.taskRunning || h.activeWork > 0
+}
+
+// rejectIfTaskRunning 在 AI 任务运行期间拒绝编辑类请求，防止意外提交修改。
+// 返回 true 表示已写入 409 响应，调用方应直接 return。
+func (h *Handlers) rejectIfTaskRunning(w http.ResponseWriter) bool {
+	if h.isTaskRunning() {
+		h.writeError(w, http.StatusConflict, "有AI任务正在运行，暂不能修改，请等待任务完成或先停止任务")
+		return true
+	}
+	return false
+}
+
+func (h *Handlers) isAutoConfirmOn() bool {
+	h.taskMu.Lock()
+	defer h.taskMu.Unlock()
+	return h.autoConfirm
+}
+
+func (h *Handlers) GetAutoConfirm(w http.ResponseWriter, r *http.Request) {
+	h.writeJSON(w, http.StatusOK, map[string]bool{"enabled": h.isAutoConfirmOn()})
+}
+
+// PutAutoConfirm 切换自动确认模式，任务运行期间也可随时开关。
+func (h *Handlers) PutAutoConfirm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
+		return
+	}
+
+	h.taskMu.Lock()
+	h.autoConfirm = req.Enabled
+	h.taskMu.Unlock()
+
+	if req.Enabled {
+		h.logger.Info("已开启自动确认模式：每章生成完成后将自动确认并继续生成下一章")
+	} else {
+		h.logger.Info("已关闭自动确认模式")
+	}
+	h.writeJSON(w, http.StatusOK, map[string]bool{"enabled": req.Enabled})
 }
 
 func (h *Handlers) PostTaskStop(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +245,9 @@ func (h *Handlers) GetAPIConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutAPIConfig(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var newCfg APIConfig
 	if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
 		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
@@ -132,6 +277,9 @@ func (h *Handlers) GetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutConfig(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var newCfg Config
 	if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
 		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
@@ -180,12 +328,54 @@ func (h *Handlers) DeleteProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PostOutlineGenerate(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w) {
+		return
+	}
+	// 检查是否有写作中/审核中/已确认的章节，如果有则拒绝
+	for _, ch := range h.state.Chapters {
+		if ch.Status == StatusWriting || ch.Status == StatusReview {
+			h.writeError(w, http.StatusConflict, "有正在写作/审核中的章节，请先处理后再重新生成大纲")
+			return
+		}
+		if ch.Status == StatusAccepted {
+			h.writeError(w, http.StatusConflict, "存在已确认章节，无法整体重新生成大纲。如需追加章节请使用「生成后续大纲」")
+			return
+		}
+	}
+
 	if !h.tryStartTask() {
 		h.writeError(w, http.StatusConflict, "有任务正在运行，请等待完成")
 		return
 	}
 
 	go func() {
+		defer h.endTask()
+
+		// 自动清除旧的大纲（仅 pending 章节，保留 accepted 的通过正常流程处理）
+		hasPending := false
+		for _, ch := range h.state.Chapters {
+			if ch.Status == StatusPending {
+				hasPending = true
+				break
+			}
+		}
+		if hasPending {
+			var kept []ChapterState
+			for _, ch := range h.state.Chapters {
+				if ch.Status != StatusPending {
+					kept = append(kept, ch)
+				}
+			}
+			h.state.Chapters = kept
+			if len(h.state.Chapters) == 0 {
+				h.state.Title = ""
+				h.state.CorePrompt = ""
+				h.state.StorySynopsis = ""
+				h.state.StoryConfigSnapshot = nil
+				h.state.CurrentChapterIndex = 0
+			}
+			h.logger.Info("已自动清除旧的大纲（pending 章节）")
+		}
 		h.logger.TaskStart("outline_generation")
 		ctx := h.taskCtx
 
@@ -193,7 +383,6 @@ func (h *Handlers) PostOutlineGenerate(w http.ResponseWriter, r *http.Request) {
 		err := GenerateOutlineAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, h.logger)
 
 		if err != nil {
-			h.endTask()
 			if ctx.Err() != nil {
 				h.logger.Warn("大纲生成已取消")
 				h.logger.TaskEnd("outline_generation", false)
@@ -204,7 +393,6 @@ func (h *Handlers) PostOutlineGenerate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		h.endTask()
 		h.logger.Success("大纲生成完成！")
 		h.logger.TaskEnd("outline_generation", true)
 		h.broadcastProgress()
@@ -254,6 +442,7 @@ func (h *Handlers) PostOutlineRevise(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
+		defer h.endTask()
 		h.logger.TaskStart("outline_revision")
 		ctx := h.taskCtx
 
@@ -261,7 +450,6 @@ func (h *Handlers) PostOutlineRevise(w http.ResponseWriter, r *http.Request) {
 		err := ReviseOutlineAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, body.Feedback, h.logger)
 
 		if err != nil {
-			h.endTask()
 			if ctx.Err() != nil {
 				h.logger.Warn("大纲修订已取消")
 				h.logger.TaskEnd("outline_revision", false)
@@ -272,7 +460,6 @@ func (h *Handlers) PostOutlineRevise(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		h.endTask()
 		h.logger.Success("大纲已修订。")
 		h.logger.TaskEnd("outline_revision", true)
 		h.broadcastProgress()
@@ -288,32 +475,54 @@ func (h *Handlers) PostChapterGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
+		defer h.endTask()
 		h.logger.TaskStart("chapter_generation")
 		ctx := h.taskCtx
 
-		chIdx := h.state.CurrentChapterIndex
-		chTitle := ""
-		if chIdx < len(h.state.Chapters) {
-			chTitle = h.state.Chapters[chIdx].Title
-		}
-
-		h.logger.Info(fmt.Sprintf("正在创作第 %d 章...", chIdx+1))
-		err := GenerateChapterAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, h.settings, h.logger)
-
-		if err != nil {
-			h.endTask()
-			if ctx.Err() != nil {
-				h.logger.Warn("章节创作已取消")
-				h.logger.TaskEnd("chapter_generation", false)
-			} else {
-				h.logger.Error(fmt.Sprintf("章节创作失败: %v", err))
-				h.logger.TaskEnd("chapter_generation", false)
+		for {
+			chIdx := h.state.CurrentChapterIndex
+			chTitle := ""
+			if chIdx < len(h.state.Chapters) {
+				chTitle = h.state.Chapters[chIdx].Title
 			}
-			return
+
+			h.logger.Info(fmt.Sprintf("正在创作第 %d 章...", chIdx+1))
+			err := GenerateChapterAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, h.settings, h.logger)
+
+			if err != nil {
+				if ctx.Err() != nil {
+					h.logger.Warn("章节创作已取消")
+				} else {
+					h.logger.Error(fmt.Sprintf("章节创作失败: %v", err))
+				}
+				h.logger.TaskEnd("chapter_generation", false)
+				return
+			}
+
+			h.logger.Success(fmt.Sprintf("第 %d 章《%s》创作完成！", chIdx+1, chTitle))
+			h.broadcastProgress()
+
+			// 自动确认模式：自动确认本章并继续生成下一章；关闭开关后在本章结束时停止
+			if !h.isAutoConfirmOn() {
+				break
+			}
+			if err := ConfirmChapterAction(h.state, h.progressPath); err != nil {
+				h.logger.Warn(fmt.Sprintf("自动确认失败: %v", err))
+				break
+			}
+			h.logger.Success(fmt.Sprintf("第 %d 章《%s》已自动确认。", chIdx+1, chTitle))
+			h.broadcastProgress()
+
+			if h.state.CurrentChapterIndex >= len(h.state.Chapters) {
+				h.logger.Success("全部章节已创作完成！")
+				break
+			}
+			if ctx.Err() != nil {
+				h.logger.Warn("任务已取消，停止自动续写")
+				break
+			}
 		}
 
-		h.endTask()
-		h.logger.Success(fmt.Sprintf("第 %d 章《%s》创作完成！", chIdx+1, chTitle))
 		h.logger.TaskEnd("chapter_generation", true)
 		h.broadcastProgress()
 	}()
@@ -358,14 +567,14 @@ func (h *Handlers) PostChapterRevise(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
+		defer h.endTask()
 		h.logger.TaskStart("chapter_revision")
 		ctx := h.taskCtx
 
 		h.logger.Info("正在根据意见修改当前章节...")
-		err := ReviseChapterAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, body.Feedback, h.logger)
+		err := ReviseChapterAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, body.Feedback, h.settings, h.logger)
 
 		if err != nil {
-			h.endTask()
 			if ctx.Err() != nil {
 				h.logger.Warn("章节修订已取消")
 				h.logger.TaskEnd("chapter_revision", false)
@@ -376,9 +585,105 @@ func (h *Handlers) PostChapterRevise(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		h.endTask()
 		h.logger.Success("章节已修订。")
 		h.logger.TaskEnd("chapter_revision", true)
+		h.broadcastProgress()
+	}()
+
+	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+}
+
+// PostChapterReviseSpecific 对指定编号章节做定向最小化修订（含已确认章节），
+// 仅修改该章正文与摘要，不影响其他章节和大纲。
+func (h *Handlers) PostChapterReviseSpecific(w http.ResponseWriter, r *http.Request) {
+	numStr := r.PathValue("num")
+	var num int
+	if _, err := fmt.Sscanf(numStr, "%d", &num); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的章节编号")
+		return
+	}
+
+	if !h.tryStartTask() {
+		h.writeError(w, http.StatusConflict, "有任务正在运行，请等待完成")
+		return
+	}
+
+	var body struct {
+		Feedback string `json:"feedback"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Feedback == "" {
+		h.endTask()
+		h.writeError(w, http.StatusBadRequest, "缺少 feedback 字段")
+		return
+	}
+
+	go func() {
+		defer h.endTask()
+		h.logger.TaskStart("chapter_revision")
+		ctx := h.taskCtx
+
+		h.logger.Info(fmt.Sprintf("正在定向修订第 %d 章...", num))
+		err := ReviseSpecificChapterAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, num, body.Feedback, h.settings, h.logger)
+
+		if err != nil {
+			if ctx.Err() != nil {
+				h.logger.Warn("章节修订已取消")
+			} else {
+				h.logger.Error(fmt.Sprintf("章节修订失败: %v", err))
+			}
+			h.logger.TaskEnd("chapter_revision", false)
+			return
+		}
+
+		h.logger.TaskEnd("chapter_revision", true)
+		h.broadcastProgress()
+	}()
+
+	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+}
+
+// PostChaptersSmoothTransitions 批量优化已确认章节之间的衔接（修补旧项目用）。
+// 逐章检查上一章结尾与本章开头的衔接，仅在生硬时最小化重写本章开头片段。
+func (h *Handlers) PostChaptersSmoothTransitions(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w) {
+		return
+	}
+
+	pairs := 0
+	for i := 1; i < len(h.state.Chapters); i++ {
+		if h.state.Chapters[i].Status == StatusAccepted && h.state.Chapters[i].Content != "" &&
+			h.state.Chapters[i-1].Status == StatusAccepted && h.state.Chapters[i-1].Content != "" {
+			pairs++
+		}
+	}
+	if pairs == 0 {
+		h.writeError(w, http.StatusBadRequest, "没有可优化的章节（需要至少两个相邻的已确认章节）")
+		return
+	}
+
+	if !h.tryStartTask() {
+		h.writeError(w, http.StatusConflict, "有任务正在运行，请等待完成")
+		return
+	}
+
+	go func() {
+		defer h.endTask()
+		h.logger.TaskStart("smooth_transitions")
+		ctx := h.taskCtx
+
+		err := SmoothTransitionsAction(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, h.logger)
+		if err != nil {
+			if ctx.Err() != nil {
+				h.logger.Warn("章节衔接优化已取消（已完成部分不会丢失）")
+			} else {
+				h.logger.Error(fmt.Sprintf("章节衔接优化失败: %v", err))
+			}
+			h.logger.TaskEnd("smooth_transitions", false)
+			h.broadcastProgress()
+			return
+		}
+
+		h.logger.TaskEnd("smooth_transitions", true)
 		h.broadcastProgress()
 	}()
 
@@ -404,8 +709,7 @@ func (h *Handlers) DeleteChapter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mdFile := fmt.Sprintf("Chapter_%02d.md", ch.Num)
-	deleteFile(mdFile)
+	deleteFile(ChapterMarkdownPath(h.projectDir(), ch.Num))
 
 	h.state.Chapters = h.state.Chapters[:lastIdx]
 
@@ -507,6 +811,7 @@ func (h *Handlers) PostSettingsReconcile(w http.ResponseWriter, r *http.Request)
 	}
 
 	go func() {
+		defer h.endTask()
 		h.logger.TaskStart("settings_reconciliation")
 		ctx := h.taskCtx
 
@@ -514,7 +819,6 @@ func (h *Handlers) PostSettingsReconcile(w http.ResponseWriter, r *http.Request)
 		err := ReconcileSettingsAction(ctx, h.apiCfg, h.cfg, h.state, body, h.progressPath, h.cfgPath, h.logger)
 
 		if err != nil {
-			h.endTask()
 			if ctx.Err() != nil {
 				h.logger.Warn("设定协调已取消")
 				h.logger.TaskEnd("settings_reconciliation", false)
@@ -525,7 +829,6 @@ func (h *Handlers) PostSettingsReconcile(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
-		h.endTask()
 		h.logger.Success("设定协调完成！")
 		h.logger.TaskEnd("settings_reconciliation", true)
 		h.broadcastProgress()
@@ -569,7 +872,7 @@ func (h *Handlers) DeleteChaptersFrom(w http.ResponseWriter, r *http.Request) {
 	deletedCount := len(h.state.Chapters) - startIdx
 
 	for i := startIdx; i < len(h.state.Chapters); i++ {
-		mdFile := fmt.Sprintf("Chapter_%02d.md", h.state.Chapters[i].Num)
+		mdFile := ChapterMarkdownPath(h.projectDir(), h.state.Chapters[i].Num)
 		if err := deleteFile(mdFile); err != nil {
 			h.logger.Warn(fmt.Sprintf("删除文件 %s 失败: %v", mdFile, err))
 		}
@@ -609,13 +912,13 @@ func (h *Handlers) broadcastProgress() {
 		pct = float64(accepted) / float64(total) * 100
 	}
 	h.logger.ProgressUpdate(map[string]interface{}{
-		"phase":            h.state.Phase,
-		"title":            h.state.Title,
-		"current_chapter":  h.state.CurrentChapterIndex,
-		"total_chapters":   total,
+		"phase":             h.state.Phase,
+		"title":             h.state.Title,
+		"current_chapter":   h.state.CurrentChapterIndex,
+		"total_chapters":    total,
 		"accepted_chapters": accepted,
-		"percent":          pct,
-		"is_task_running":  h.isTaskRunning(),
+		"percent":           pct,
+		"is_task_running":   h.isTaskRunning(),
 	})
 }
 
@@ -625,6 +928,7 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 		"title":           h.state.Title,
 		"total_chapters":  len(h.state.Chapters),
 		"is_task_running": h.isTaskRunning(),
+		"auto_confirm":    h.isAutoConfirmOn(),
 	})
 }
 
@@ -649,6 +953,7 @@ func (h *Handlers) PostForeshadowsSuggest(w http.ResponseWriter, r *http.Request
 	}
 
 	go func() {
+		defer h.endTask()
 		h.logger.TaskStart("foreshadow_suggest")
 		ctx := h.taskCtx
 
@@ -656,7 +961,6 @@ func (h *Handlers) PostForeshadowsSuggest(w http.ResponseWriter, r *http.Request
 		suggestions, err := SuggestForeshadows(ctx, h.apiCfg, h.cfg, h.state, h.logger)
 
 		if err != nil {
-			h.endTask()
 			if ctx.Err() != nil {
 				h.logger.Warn("伏笔建议已取消")
 				h.logger.TaskEnd("foreshadow_suggest", false)
@@ -667,7 +971,6 @@ func (h *Handlers) PostForeshadowsSuggest(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		h.endTask()
 		h.logger.Success(fmt.Sprintf("伏笔建议生成完成，共 %d 条", len(suggestions)))
 		h.logger.TaskEnd("foreshadow_suggest", true)
 		h.logger.ForeshadowSuggestions(suggestions)
@@ -677,6 +980,9 @@ func (h *Handlers) PostForeshadowsSuggest(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handlers) PostForeshadow(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var req struct {
 		Name          string `json:"name"`
 		Description   string `json:"description"`
@@ -717,6 +1023,9 @@ func (h *Handlers) PostForeshadow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutForeshadow(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	idStr := r.PathValue("id")
 	var id int
 	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
@@ -725,12 +1034,12 @@ func (h *Handlers) PutForeshadow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name          string          `json:"name"`
-		Description   string          `json:"description"`
-		PlantChapter  int             `json:"plant_chapter"`
-		TargetChapter int             `json:"target_chapter"`
+		Name          string           `json:"name"`
+		Description   string           `json:"description"`
+		PlantChapter  int              `json:"plant_chapter"`
+		TargetChapter int              `json:"target_chapter"`
 		Status        ForeshadowStatus `json:"status"`
-		Resolution    string          `json:"resolution"`
+		Resolution    string           `json:"resolution"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
@@ -778,6 +1087,9 @@ func (h *Handlers) PutForeshadow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeleteForeshadow(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	idStr := r.PathValue("id")
 	var id int
 	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
@@ -808,6 +1120,9 @@ func (h *Handlers) DeleteForeshadow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PostForeshadowsConfirm(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var req struct {
 		Foreshadows []Foreshadow `json:"foreshadows"`
 	}
@@ -850,6 +1165,7 @@ func (h *Handlers) PostContinueImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
+		defer h.endTask()
 		h.logger.TaskStart("continue_analysis")
 		ctx := h.taskCtx
 
@@ -857,7 +1173,6 @@ func (h *Handlers) PostContinueImport(w http.ResponseWriter, r *http.Request) {
 		analysis, err := AnalyzeExistingContent(ctx, h.apiCfg, h.cfg, body.Content)
 
 		if err != nil {
-			h.endTask()
 			if ctx.Err() != nil {
 				h.logger.Warn("内容分析已取消")
 				h.logger.TaskEnd("continue_analysis", false)
@@ -870,7 +1185,6 @@ func (h *Handlers) PostContinueImport(w http.ResponseWriter, r *http.Request) {
 
 		h.pendingContinueContent = body.Content
 
-		h.endTask()
 		h.logger.Success(fmt.Sprintf("内容分析完成，发现 %d 章", len(analysis.Chapters)))
 		h.logger.TaskEnd("continue_analysis", true)
 		h.logger.ContinueAnalysisResult(analysis)
@@ -938,6 +1252,7 @@ func (h *Handlers) PostOutlineGenerateContinuation(w http.ResponseWriter, r *htt
 	}
 
 	go func() {
+		defer h.endTask()
 		h.logger.TaskStart("continuation_outline")
 		ctx := h.taskCtx
 
@@ -945,7 +1260,6 @@ func (h *Handlers) PostOutlineGenerateContinuation(w http.ResponseWriter, r *htt
 		err := GenerateContinuationOutline(ctx, h.apiCfg, h.cfg, h.state, body.ChapterCount, h.progressPath, h.logger)
 
 		if err != nil {
-			h.endTask()
 			if ctx.Err() != nil {
 				h.logger.Warn("续写大纲生成已取消")
 				h.logger.TaskEnd("continuation_outline", false)
@@ -956,7 +1270,6 @@ func (h *Handlers) PostOutlineGenerateContinuation(w http.ResponseWriter, r *htt
 			return
 		}
 
-		h.endTask()
 		h.logger.Success("续写大纲生成完成！")
 		h.logger.TaskEnd("continuation_outline", true)
 		h.broadcastProgress()
@@ -1004,6 +1317,9 @@ func (h *Handlers) GetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PostCharacter(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var c Character
 	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
@@ -1026,6 +1342,9 @@ func (h *Handlers) PostCharacter(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutCharacter(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req Character
@@ -1075,6 +1394,9 @@ func (h *Handlers) PutCharacter(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeleteCharacter(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	for i, c := range h.settings.Characters {
@@ -1093,6 +1415,9 @@ func (h *Handlers) DeleteCharacter(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PostWorldview(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var wv WorldviewEntry
 	if err := json.NewDecoder(r.Body).Decode(&wv); err != nil {
 		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
@@ -1115,6 +1440,9 @@ func (h *Handlers) PostWorldview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutWorldview(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req WorldviewEntry
@@ -1152,6 +1480,9 @@ func (h *Handlers) PutWorldview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeleteWorldview(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	for i, wv := range h.settings.Worldview {
@@ -1170,6 +1501,9 @@ func (h *Handlers) DeleteWorldview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PostOrganization(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var o Organization
 	if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
 		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
@@ -1192,6 +1526,9 @@ func (h *Handlers) PostOrganization(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutOrganization(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req Organization
@@ -1229,6 +1566,9 @@ func (h *Handlers) PutOrganization(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeleteOrganization(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	for i, o := range h.settings.Organizations {
@@ -1247,6 +1587,9 @@ func (h *Handlers) DeleteOrganization(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PostRelation(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	var rel Relation
 	if err := json.NewDecoder(r.Body).Decode(&rel); err != nil {
 		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
@@ -1269,6 +1612,9 @@ func (h *Handlers) PostRelation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutRelation(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req Relation
@@ -1309,6 +1655,9 @@ func (h *Handlers) PutRelation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeleteRelation(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	for i, rel := range h.settings.Relations {
@@ -1327,224 +1676,15 @@ func (h *Handlers) DeleteRelation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PostSettingsAIGenerate(w http.ResponseWriter, r *http.Request) {
-	if !h.tryStartTask() {
-		h.writeError(w, http.StatusConflict, "有任务正在运行，请等待完成")
-		return
-	}
-
-	go func() {
-		h.logger.TaskStart("ai_settings_generate")
-		ctx := h.taskCtx
-
-		h.logger.Info("正在 AI 自动生成设定...")
-		err := h.aiGenerateSettings(ctx)
-
-		if err != nil {
-			h.endTask()
-			if ctx.Err() != nil {
-				h.logger.Warn("AI 设定生成已取消")
-				h.logger.TaskEnd("ai_settings_generate", false)
-			} else {
-				h.logger.Error(fmt.Sprintf("AI 设定生成失败: %v", err))
-				h.logger.TaskEnd("ai_settings_generate", false)
-			}
-			return
-		}
-
-		h.endTask()
-		h.logger.Success("AI 设定生成完成！")
-		h.logger.TaskEnd("ai_settings_generate", true)
-	}()
-
-	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
-}
-
-func (h *Handlers) aiGenerateSettings(ctx context.Context) error {
-	outline := ""
-	for _, ch := range h.state.Chapters {
-		outline += fmt.Sprintf("第%d章《%s》: %s\n", ch.Num, ch.Title, ch.Outline)
-	}
-
-	if outline == "" {
-		outline = "暂无大纲"
-	}
-
-	snapshot := h.state.StoryConfigSnapshot
-	if snapshot == nil {
-		snapshot = &h.cfg.Story
-	}
-
-	userPrompt := fmt.Sprintf(`请根据以下小说信息，生成详细的角色设定和世界观设定。
-
-小说标题: 《%s》
-故事类型: %s
-写作风格: %s
-故事梗概: %s
-
-大纲:
-%s
-
-请以JSON格式返回：
-{
-  "characters": [
-    {
-      "name": "角色名",
-      "age": "年龄",
-      "appearance": "外貌描述",
-      "personality": "性格特点",
-      "background": "背景故事",
-      "motivation": "核心动机",
-      "abilities": "能力/技能",
-      "notes": "其他备注"
-    }
-  ],
-  "worldview": [
-    {
-      "category": "geography/faction/rule/history/other",
-      "name": "名称",
-      "description": "详细描述",
-      "tags": "相关标签"
-    }
-  ],
-  "organizations": [
-    {
-      "name": "组织名",
-      "type": "family/sect/nation/guild/other",
-      "description": "组织描述",
-      "members": []
-    }
-  ]
-}
-
-注意：
-1. 角色应覆盖大纲中的主要人物
-2. 世界观应涵盖故事所需的重要设定
-3. 组织应反映故事中的势力结构
-4. 请严格以JSON格式输出`,
-		h.state.Title, snapshot.Type, snapshot.WritingStyle,
-		snapshot.StorySynopsis, outline)
-
-	systemPrompt := "你是一位专业的小说设定生成师。请严格按照要求的JSON格式输出，不要添加任何额外文字或markdown代码块标记。"
-
-	rawResp := CallAPIWithRetryLog(ctx, h.apiCfg, systemPrompt, userPrompt, h.logger)
-	rawResp = cleanJSONResponse(rawResp)
-
-	var resp struct {
-		Characters    []Character      `json:"characters"`
-		Worldview     []WorldviewEntry `json:"worldview"`
-		Organizations []Organization   `json:"organizations"`
-	}
-	if err := json.Unmarshal([]byte(rawResp), &resp); err != nil {
-		return fmt.Errorf("解析AI生成结果失败: %w", err)
-	}
-
-	for i := range resp.Characters {
-		resp.Characters[i].ID = h.settings.nextCharacterID()
-		h.settings.Characters = append(h.settings.Characters, resp.Characters[i])
-	}
-
-	for i := range resp.Worldview {
-		resp.Worldview[i].ID = h.settings.nextWorldviewID()
-		h.settings.Worldview = append(h.settings.Worldview, resp.Worldview[i])
-	}
-
-	for i := range resp.Organizations {
-		resp.Organizations[i].ID = h.settings.nextOrganizationID()
-		h.settings.Organizations = append(h.settings.Organizations, resp.Organizations[i])
-	}
-
-	if err := SaveProjectSettings(h.settingsPath, h.settings); err != nil {
-		return fmt.Errorf("保存设定失败: %w", err)
-	}
-
-	h.logger.Info(fmt.Sprintf("已生成 %d 个角色、%d 条世界观、%d 个组织",
-		len(resp.Characters), len(resp.Worldview), len(resp.Organizations)))
-
-	return nil
+	h.writeError(w, http.StatusGone, "此功能已移至 LLM 对话中，请通过聊天让 AI 帮你生成设定")
 }
 
 func (h *Handlers) PostSettingsPolish(w http.ResponseWriter, r *http.Request) {
-	if !h.tryStartTask() {
-		h.writeError(w, http.StatusConflict, "有任务正在运行，请等待完成")
-		return
-	}
+	h.writeError(w, http.StatusGone, "此功能已移至 LLM 对话中，请通过聊天让 AI 帮你润色")
+}
 
-	var req struct {
-		FieldType string `json:"field_type"`
-		Content   string `json:"content"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.endTask()
-		h.writeError(w, http.StatusBadRequest, "无效的JSON: "+err.Error())
-		return
-	}
-	if req.FieldType == "" {
-		h.endTask()
-		h.writeError(w, http.StatusBadRequest, "缺少 field_type")
-		return
-	}
-
-	go func() {
-		h.logger.TaskStart("settings_polish")
-		ctx := h.taskCtx
-
-		h.logger.Info("正在 AI 润色...")
-
-		outline := ""
-		for _, ch := range h.state.Chapters {
-			outline += fmt.Sprintf("第%d章《%s》: %s\n", ch.Num, ch.Title, ch.Outline)
-		}
-		if outline == "" {
-			outline = "暂无大纲"
-		}
-
-		snapshot := h.state.StoryConfigSnapshot
-		if snapshot == nil {
-			snapshot = &h.cfg.Story
-		}
-
-		var systemPrompt, userPrompt string
-
-		switch req.FieldType {
-		case "character":
-			systemPrompt = "你是一位专业的小说角色设计师。请根据已有信息补充和润色角色设定，保持原有信息不变，补充空白的字段。输出格式与输入相同，包含所有字段。"
-			userPrompt = fmt.Sprintf("小说标题: 《%s》\n故事类型: %s\n写作风格: %s\n故事梗概: %s\n\n大纲:\n%s\n\n当前角色信息:\n%s\n\n请对以上角色设定进行润色和补充。保留已有内容，为未填写的字段补充合理的内容。直接输出润色后的完整角色设定文本，保持原有格式。", h.state.Title, snapshot.Type, snapshot.WritingStyle, snapshot.StorySynopsis, outline, req.Content)
-		case "worldview":
-			systemPrompt = "你是一位专业的小说世界观架构师。请根据已有信息补充和润色世界观设定，保持原有信息不变，补充空白的内容。"
-			userPrompt = fmt.Sprintf("小说标题: 《%s》\n故事类型: %s\n写作风格: %s\n故事梗概: %s\n\n大纲:\n%s\n\n当前世界观设定:\n%s\n\n请对以上世界观设定进行润色和补充。保留已有内容，补充缺失的细节。直接输出润色后的完整文本。", h.state.Title, snapshot.Type, snapshot.WritingStyle, snapshot.StorySynopsis, outline, req.Content)
-		case "writing_style":
-			systemPrompt = "你是一位专业的文学风格顾问。请根据已有信息润色和补充写作风格描述。"
-			userPrompt = fmt.Sprintf("小说标题: 《%s》\n故事类型: %s\n故事梗概: %s\n\n大纲:\n%s\n\n当前写作风格描述:\n%s\n\n请对以上写作风格描述进行润色和补充，使其更加具体和有指导性。直接输出润色后的完整文本。", h.state.Title, snapshot.Type, snapshot.StorySynopsis, outline, req.Content)
-		case "story_synopsis":
-			systemPrompt = "你是一位专业的小说策划编辑。请根据已有信息润色和补充故事梗概。"
-			userPrompt = fmt.Sprintf("小说标题: 《%s》\n故事类型: %s\n写作风格: %s\n\n大纲:\n%s\n\n当前故事梗概:\n%s\n\n请对以上故事梗概进行润色和补充，使其包含完整的故事主线走向、核心冲突、关键转折点等要素。直接输出润色后的完整文本。", h.state.Title, snapshot.Type, snapshot.WritingStyle, outline, req.Content)
-		default:
-			h.endTask()
-			h.logger.Error("未知的字段类型: " + req.FieldType)
-			h.logger.TaskEnd("settings_polish", false)
-			return
-		}
-
-		result := CallAPIWithRetryLog(ctx, h.apiCfg, systemPrompt, userPrompt, h.logger)
-		if result == "" {
-			h.endTask()
-			if ctx.Err() != nil {
-				h.logger.Warn("AI 润色已取消")
-				h.logger.TaskEnd("settings_polish", false)
-			} else {
-				h.logger.Error("AI 润色失败")
-				h.logger.TaskEnd("settings_polish", false)
-			}
-			return
-		}
-
-		h.endTask()
-		h.logger.Success("AI 润色完成！")
-		h.logger.TaskEnd("settings_polish", true)
-		h.logger.SettingsPolishResult(req.FieldType, result)
-	}()
-
-	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+func (h *Handlers) PostChapterPolish(w http.ResponseWriter, r *http.Request) {
+	h.writeError(w, http.StatusGone, "此功能已移至 LLM 对话中，请通过聊天让 AI 帮你去AI味")
 }
 
 func (h *Handlers) GetSkills(w http.ResponseWriter, r *http.Request) {
@@ -1566,6 +1706,9 @@ func (h *Handlers) GetSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) PutSkillToggle(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	var req struct {
@@ -1603,68 +1746,6 @@ func (h *Handlers) PutSkillToggle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.writeJSON(w, http.StatusOK, map[string]interface{}{"id": id, "enabled": req.Enabled})
-}
-
-func (h *Handlers) PostChapterPolish(w http.ResponseWriter, r *http.Request) {
-	if !h.tryStartTask() {
-		h.writeError(w, http.StatusConflict, "有任务正在运行，请等待完成")
-		return
-	}
-
-	polishSkills := GetEnabledSkillsByCategory(h.skills, h.cfg.SkillConfig, "polish")
-	if len(polishSkills) == 0 {
-		h.endTask()
-		h.writeError(w, http.StatusBadRequest, "没有启用的润色技能，请先在技能管理页启用 polish 类技能")
-		return
-	}
-
-	go func() {
-		h.logger.TaskStart("chapter_polish")
-		ctx := h.taskCtx
-
-		chIdx := h.state.CurrentChapterIndex
-		if chIdx >= len(h.state.Chapters) {
-			chIdx = len(h.state.Chapters) - 1
-		}
-		if chIdx < 0 || chIdx >= len(h.state.Chapters) {
-			h.endTask()
-			h.logger.Error("没有可润色的章节")
-			h.logger.TaskEnd("chapter_polish", false)
-			return
-		}
-
-		if h.state.Chapters[chIdx].Status != StatusReview && chIdx > 0 {
-			chIdx = chIdx - 1
-		}
-		if h.state.Chapters[chIdx].Status != StatusReview {
-			h.endTask()
-			h.logger.Error("当前没有处于审核状态的章节可润色")
-			h.logger.TaskEnd("chapter_polish", false)
-			return
-		}
-
-		h.logger.Info(fmt.Sprintf("正在对第 %d 章进行去AI味处理...", h.state.Chapters[chIdx].Num))
-		err := PolishChapterAction(ctx, h.apiCfg, h.cfg, h.state, chIdx, polishSkills, h.progressPath, h.logger)
-
-		if err != nil {
-			h.endTask()
-			if ctx.Err() != nil {
-				h.logger.Warn("去AI味处理已取消")
-				h.logger.TaskEnd("chapter_polish", false)
-			} else {
-				h.logger.Error(fmt.Sprintf("去AI味失败: %v", err))
-				h.logger.TaskEnd("chapter_polish", false)
-			}
-			return
-		}
-
-		h.endTask()
-		h.logger.Success(fmt.Sprintf("第 %d 章去AI味完成！", h.state.Chapters[chIdx].Num))
-		h.logger.TaskEnd("chapter_polish", true)
-		h.broadcastProgress()
-	}()
-
-	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
 }
 
 func (h *Handlers) GetChatSessions(w http.ResponseWriter, r *http.Request) {
@@ -1710,6 +1791,9 @@ func (h *Handlers) GetChatSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeleteChatSession(w http.ResponseWriter, r *http.Request) {
+	if h.rejectIfTaskRunning(w) {
+		return
+	}
 	id := r.PathValue("id")
 
 	if err := DeleteChatSession(h.sessionsDir, id); err != nil {
@@ -1729,7 +1813,8 @@ func (h *Handlers) PostChatMessage(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
 
 	var req struct {
-		Content string `json:"content"`
+		Content     string `json:"content"`
+		ContextPage string `json:"context_page"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Content == "" {
 		h.endTask()
@@ -1737,28 +1822,38 @@ func (h *Handlers) PostChatMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, err := LoadChatSession(h.sessionsDir, sessionID)
+	if err != nil {
+		h.endTask()
+		h.writeError(w, http.StatusNotFound, "会话不存在")
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	session.Messages = append(session.Messages, ChatMessage{
+		Role:      "user",
+		Content:   req.Content,
+		Timestamp: now,
+	})
+
+	if len(session.Messages) == 1 {
+		session.Title = generateChatTitle(req.Content)
+	}
+
+	if err := SaveChatSession(h.sessionsDir, session); err != nil {
+		h.endTask()
+		h.writeError(w, http.StatusInternalServerError, "保存会话失败: "+err.Error())
+		return
+	}
+
+	// 缓存消息用于重试
+	h.lastChatMessage = req.Content
+
 	go func() {
+		// defer 确保任何错误路径都会释放任务锁，否则后续所有任务将永久 409
+		defer h.endTask()
 		h.logger.TaskStart("chat_message")
 		ctx := h.taskCtx
-
-		session, err := LoadChatSession(h.sessionsDir, sessionID)
-		if err != nil {
-			h.endTask()
-			h.logger.Error(fmt.Sprintf("加载会话失败: %v", err))
-			h.logger.TaskEnd("chat_message", false)
-			return
-		}
-
-		now := time.Now().Format(time.RFC3339)
-		session.Messages = append(session.Messages, ChatMessage{
-			Role:      "user",
-			Content:   req.Content,
-			Timestamp: now,
-		})
-
-		if len(session.Messages) == 1 {
-			session.Title = generateChatTitle(req.Content)
-		}
 
 		var history []AgentStep
 		for _, m := range session.Messages {
@@ -1783,40 +1878,47 @@ func (h *Handlers) PostChatMessage(w http.ResponseWriter, r *http.Request) {
 			Config:       h.cfg,
 			Skills:       h.skills,
 			Logger:       h.logger,
+			ContextPage:  req.ContextPage,
+			ProgressPath: h.progressPath,
+			CfgPath:      h.cfgPath,
+			SessionsDir:  h.sessionsDir,
+			ProjectDir:   filepath.Join(h.progDir, "storys", h.projectName),
+			StartAsync: func(taskName string, fn func(goCtx context.Context)) {
+				// 子任务必须计入 activeWork，否则 Agent 主循环结束后锁被释放，
+				// 子任务仍在运行时新任务可并发进入，造成数据竞争。
+				if !h.startChildWork() {
+					h.logger.Warn(fmt.Sprintf("无法启动子任务 %s：主任务已结束", taskName))
+					return
+				}
+				childCtx := h.taskCtx
+				go func() {
+					defer h.endTask()
+					h.logger.TaskStart(taskName)
+					fn(childCtx)
+					h.logger.TaskEnd(taskName, true)
+					h.broadcastProgress()
+				}()
+			},
 		}
 
-		reply, newHistory, err := RunAgentLoop(ctx, agentCtx, req.Content, history, 10)
+		reply, newHistory, err := RunAgentLoop(ctx, agentCtx, req.Content, history, 30)
 		if err != nil {
-			h.endTask()
+			// 即使失败也保存已产生的对话步骤，避免上下文丢失
+			saveAgentSteps(session, newHistory[len(history):])
+			session.UpdatedAt = time.Now().Format(time.RFC3339)
+			if saveErr := SaveChatSession(h.sessionsDir, session); saveErr != nil {
+				h.logger.Warn(fmt.Sprintf("保存会话失败: %v", saveErr))
+			}
 			if ctx.Err() != nil {
 				h.logger.Warn("助理对话已取消")
-				h.logger.TaskEnd("chat_message", false)
 			} else {
 				h.logger.Error(fmt.Sprintf("助理回复失败: %v", err))
-				h.logger.TaskEnd("chat_message", false)
 			}
+			h.logger.TaskEnd("chat_message", false)
 			return
 		}
 
-		for _, step := range newHistory[len(history):] {
-			if step.Role == "assistant" {
-				msg := ChatMessage{
-					Role:      "assistant",
-					Content:   step.Content,
-					Timestamp: time.Now().Format(time.RFC3339),
-				}
-				if step.ToolCall != nil {
-					msg.ToolCalls = []ToolCall{*step.ToolCall}
-				}
-				session.Messages = append(session.Messages, msg)
-			} else if step.Role == "tool" {
-				session.Messages = append(session.Messages, ChatMessage{
-					Role:       "tool",
-					ToolResult: step.ToolResult,
-					Timestamp:  time.Now().Format(time.RFC3339),
-				})
-			}
-		}
+		saveAgentSteps(session, newHistory[len(history):])
 
 		if reply != "" {
 			found := false
@@ -1843,12 +1945,34 @@ func (h *Handlers) PostChatMessage(w http.ResponseWriter, r *http.Request) {
 
 		h.logger.ChatChunk(sessionID, reply)
 
-		h.endTask()
 		h.logger.Success("助理回复完成")
 		h.logger.TaskEnd("chat_message", true)
 	}()
 
 	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+}
+
+// saveAgentSteps 将 Agent 步骤追加为会话消息。
+func saveAgentSteps(session *ChatSession, steps []AgentStep) {
+	for _, step := range steps {
+		if step.Role == "assistant" {
+			msg := ChatMessage{
+				Role:      "assistant",
+				Content:   step.Content,
+				Timestamp: time.Now().Format(time.RFC3339),
+			}
+			if step.ToolCall != nil {
+				msg.ToolCalls = []ToolCall{*step.ToolCall}
+			}
+			session.Messages = append(session.Messages, msg)
+		} else if step.Role == "tool" {
+			session.Messages = append(session.Messages, ChatMessage{
+				Role:       "tool",
+				ToolResult: step.ToolResult,
+				Timestamp:  time.Now().Format(time.RFC3339),
+			})
+		}
+	}
 }
 
 func writeFileAtomic(path string, data []byte) error {

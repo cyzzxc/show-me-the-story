@@ -1,7 +1,9 @@
 <script>
   import { onMount } from 'svelte';
   import { api } from '../lib/api.js';
-  import { apiConfig, config, progress, settings, taskRunning, editingCharID, editingWvID, wvFilter, addToast } from '../lib/stores.js';
+  import { apiConfig, config, progress, settings, editingCharID, editingWvID, wvFilter, addToast, showConfirm, taskRunning } from '../lib/stores.js';
+
+  export let sendToChat = async () => {};
 
   let showCharForm = false;
   let showWvForm = false;
@@ -11,7 +13,16 @@
   let charName = '', charAge = '', charAppearance = '', charPersonality = '', charBackground = '', charMotivation = '', charAbilities = '', charNotes = '';
   let wvName = '', wvCategory = 'other', wvDescription = '', wvTags = '';
 
-  let polishingField = '';
+  // 组织管理
+  let showOrgForm = false, orgCollapse = false;
+  let orgName = '', orgType = '', orgDescription = '';
+  let orgMembers = [];
+  let editingOrgID = null;
+
+  // 关系管理
+  let showRelForm = false, relCollapse = false;
+  let relSource = '', relTarget = '', relLabel = '';
+  let editingRelID = null;
 
   $: cfgBase = $apiConfig?.base_url || '';
   $: cfgModel = $apiConfig?.model || '';
@@ -21,16 +32,22 @@
   let localApiCfg = { base_url: '', model: '', api_key: '', http_timeout_seconds: 300 };
   let localStoryCfg = { type: '', title: '', chapter_count: 30, target_words_per_chapter: 2500, writing_style: '', story_synopsis: '' };
 
-  let apiCfgInitialized = false;
-  let storyCfgInitialized = false;
+  let apiCfgSnapshot = '';
+  let storyCfgSnapshot = '';
 
-  $: if ($apiConfig && !apiCfgInitialized) {
-    localApiCfg = { ...$apiConfig };
-    apiCfgInitialized = true;
+  $: if ($apiConfig) {
+    const snap = JSON.stringify($apiConfig);
+    if (snap !== apiCfgSnapshot) {
+      localApiCfg = { ...$apiConfig };
+      apiCfgSnapshot = snap;
+    }
   }
-  $: if ($config?.story && !storyCfgInitialized) {
-    localStoryCfg = { ...$config.story };
-    storyCfgInitialized = true;
+  $: if ($config?.story) {
+    const snap = JSON.stringify($config.story);
+    if (snap !== storyCfgSnapshot) {
+      localStoryCfg = { ...$config.story };
+      storyCfgSnapshot = snap;
+    }
   }
 
   $: hasAccepted = $progress?.chapters?.some(c => c.status === 'accepted') || false;
@@ -38,6 +55,25 @@
   $: chars = ($settings?.characters || []);
   $: allWvs = ($settings?.worldview || []);
   $: filteredWvs = $wvFilter === 'all' ? allWvs : allWvs.filter(w => w.category === $wvFilter);
+  $: orgs = ($settings?.organizations || []);
+  $: rels = ($settings?.relations || []);
+
+  const entityIcons = { character: '👤', organization: '🏛️', worldview: '🌍' };
+
+  // 关系双方可选实体（角色 / 组织 / 世界观条目）
+  $: entityOptions = [
+    ...chars.map(c => ({ key: 'character:' + c.id, label: '👤 ' + c.name })),
+    ...orgs.map(o => ({ key: 'organization:' + o.id, label: '🏛️ ' + o.name })),
+    ...allWvs.map(w => ({ key: 'worldview:' + w.id, label: '🌍 ' + w.name })),
+  ];
+
+  $: nameById = (() => {
+    const m = {};
+    chars.forEach(c => m[c.id] = c.name);
+    orgs.forEach(o => m[o.id] = o.name);
+    allWvs.forEach(w => m[w.id] = w.name);
+    return m;
+  })();
 
   const catLabels = { geography: '地理', faction: '势力', rule: '规则', history: '历史', other: '其他' };
   const wvTabs = [
@@ -63,16 +99,31 @@
     } catch (e) { addToast(e.message, 'error'); }
   }
 
+  // 直接保存故事配置（不经过 AI），存在已确认章节且关键设定有变化时提示协调
   async function saveStoryConfig() {
-    const cfg = { story: { ...localStoryCfg }, prompts: {}, skill_config: $config?.skill_config || null };
+    const prev = $config?.story || {};
+    const story = {
+      ...localStoryCfg,
+      chapter_count: Number(localStoryCfg.chapter_count) || 30,
+      target_words_per_chapter: Number(localStoryCfg.target_words_per_chapter) || 2500,
+    };
+    const settingsChanged =
+      story.type !== prev.type ||
+      story.writing_style !== prev.writing_style ||
+      story.story_synopsis !== prev.story_synopsis;
+
     try {
-      await api('PUT', '/api/config', cfg);
-      config.set(cfg);
-      if (hasAccepted) {
-        addToast('设定已保存，正在自动协调已有内容...', 'info');
-        try { await api('POST', '/api/settings/reconcile', cfg.story); } catch (e) { addToast('协调请求失败: ' + e.message, 'error'); }
-      } else {
-        addToast('故事配置已保存', 'success');
+      const saved = await api('PUT', '/api/config', { ...($config || {}), story });
+      config.set(saved);
+      addToast('故事配置已保存', 'success');
+
+      if (hasAccepted && settingsChanged) {
+        showConfirm('检测到关键设定有变化，且已有已确认章节。是否让 AI 协调新设定与已有内容的一致性？（推荐）', async () => {
+          try {
+            await api('POST', '/api/settings/reconcile', saved.story);
+            addToast('设定协调任务已启动', 'info');
+          } catch (e) { addToast(e.message, 'error'); }
+        });
       }
     } catch (e) { addToast(e.message, 'error'); }
   }
@@ -116,12 +167,20 @@
   }
 
   async function deleteCharacter(id) {
-    if (!confirm('确认删除此角色？')) return;
-    try {
-      await api('DELETE', '/api/characters/' + id);
-      addToast('角色已删除', 'success');
-      settings.set(await api('GET', '/api/settings'));
-    } catch (e) { addToast(e.message, 'error'); }
+    showConfirm('确认删除此角色？', async () => {
+      try {
+        await api('DELETE', '/api/characters/' + id);
+        addToast('角色已删除', 'success');
+        settings.set(await api('GET', '/api/settings'));
+      } catch (e) { addToast(e.message, 'error'); }
+    });
+  }
+
+  async function submitCharacters() {
+    if (chars.length === 0) { addToast('暂无角色可提交', 'error'); return; }
+    const lines = chars.map(c => `- ${c.name}${c.age ? '，' + c.age : ''}${c.personality ? '，' + c.personality : ''}`);
+    await sendToChat(`请查看以下角色设定（共 ${chars.length} 个）：\n${lines.join('\n')}\n请使用 read_characters 工具获取详细信息。`);
+    addToast('角色设定已提交到 AI', 'success');
   }
 
   function openWvForm(item) {
@@ -159,97 +218,119 @@
   }
 
   async function deleteWorldview(id) {
-    if (!confirm('确认删除此世界观条目？')) return;
+    showConfirm('确认删除此世界观条目？', async () => {
+      try {
+        await api('DELETE', '/api/worldview/' + id);
+        addToast('世界观条目已删除', 'success');
+        settings.set(await api('GET', '/api/settings'));
+      } catch (e) { addToast(e.message, 'error'); }
+    });
+  }
+
+  async function submitWorldview() {
+    if (allWvs.length === 0) { addToast('暂无世界观条目可提交', 'error'); return; }
+    const lines = allWvs.map(w => `- [${catLabels[w.category] || w.category}] ${w.name}: ${w.description.slice(0, 50)}`);
+    await sendToChat(`请查看以下世界观设定（共 ${allWvs.length} 条）：\n${lines.join('\n')}\n请使用 read_worldview 工具获取详细信息。`);
+    addToast('世界观设定已提交到 AI', 'success');
+  }
+
+  // —— 组织 CRUD ——
+  function openOrgForm(org) {
+    showOrgForm = true;
+    if (org) {
+      editingOrgID = org.id;
+      orgName = org.name || '';
+      orgType = org.type || '';
+      orgDescription = org.description || '';
+      orgMembers = [...(org.members || [])];
+    } else {
+      editingOrgID = null;
+      orgName = orgType = orgDescription = '';
+      orgMembers = [];
+    }
+  }
+
+  function closeOrgForm() {
+    showOrgForm = false;
+    editingOrgID = null;
+  }
+
+  async function saveOrganization() {
+    if (!orgName.trim()) { addToast('组织名不能为空', 'error'); return; }
+    const data = { name: orgName.trim(), type: orgType, description: orgDescription, members: orgMembers };
     try {
-      await api('DELETE', '/api/worldview/' + id);
-      addToast('世界观条目已删除', 'success');
+      if (editingOrgID) {
+        await api('PUT', '/api/organizations/' + editingOrgID, data);
+      } else {
+        await api('POST', '/api/organizations', data);
+      }
+      addToast('组织已保存', 'success');
+      closeOrgForm();
       settings.set(await api('GET', '/api/settings'));
     } catch (e) { addToast(e.message, 'error'); }
   }
 
-  async function aiGenerateSettings() {
+  async function deleteOrganization(id) {
+    showConfirm('确认删除此组织？', async () => {
+      try {
+        await api('DELETE', '/api/organizations/' + id);
+        addToast('组织已删除', 'success');
+        settings.set(await api('GET', '/api/settings'));
+      } catch (e) { addToast(e.message, 'error'); }
+    });
+  }
+
+  // —— 关系 CRUD ——
+  function parseEntityKey(key) {
+    const i = key.indexOf(':');
+    return { type: key.slice(0, i), id: key.slice(i + 1) };
+  }
+
+  function openRelForm(rel) {
+    showRelForm = true;
+    if (rel) {
+      editingRelID = rel.id;
+      relSource = (rel.source_type || 'character') + ':' + rel.source_id;
+      relTarget = (rel.target_type || 'character') + ':' + rel.target_id;
+      relLabel = rel.label || '';
+    } else {
+      editingRelID = null;
+      relSource = relTarget = '';
+      relLabel = '';
+    }
+  }
+
+  function closeRelForm() {
+    showRelForm = false;
+    editingRelID = null;
+  }
+
+  async function saveRelation() {
+    if (!relSource || !relTarget) { addToast('请选择关系的双方', 'error'); return; }
+    if (relSource === relTarget) { addToast('关系双方不能是同一个实体', 'error'); return; }
+    if (!relLabel.trim()) { addToast('请填写关系描述', 'error'); return; }
+    const s = parseEntityKey(relSource);
+    const t = parseEntityKey(relTarget);
+    const data = { source_id: s.id, source_type: s.type, target_id: t.id, target_type: t.type, label: relLabel.trim() };
     try {
-      await api('POST', '/api/settings/ai-generate');
-      addToast('AI 设定生成中...', 'info');
+      if (editingRelID) {
+        await api('PUT', '/api/relations/' + editingRelID, data);
+      } else {
+        await api('POST', '/api/relations', data);
+      }
+      addToast('关系已保存', 'success');
+      closeRelForm();
+      settings.set(await api('GET', '/api/settings'));
     } catch (e) { addToast(e.message, 'error'); }
   }
 
-  async function polishField(fieldType) {
-    if ($taskRunning) { addToast('有任务正在运行，请等待完成', 'error'); return; }
-    polishingField = fieldType;
-
-    let content = '';
-    if (fieldType === 'character') {
-      const parts = [];
-      if (charName.trim()) parts.push(`名称: ${charName}`);
-      if (charAge.trim()) parts.push(`年龄: ${charAge}`);
-      if (charAppearance.trim()) parts.push(`外貌: ${charAppearance}`);
-      if (charPersonality.trim()) parts.push(`性格: ${charPersonality}`);
-      if (charBackground.trim()) parts.push(`背景: ${charBackground}`);
-      if (charMotivation.trim()) parts.push(`动机: ${charMotivation}`);
-      if (charAbilities.trim()) parts.push(`能力: ${charAbilities}`);
-      if (charNotes.trim()) parts.push(`备注: ${charNotes}`);
-      content = parts.join('\n');
-    } else if (fieldType === 'worldview') {
-      const parts = [];
-      if (wvName.trim()) parts.push(`名称: ${wvName}`);
-      parts.push(`分类: ${catLabels[wvCategory] || wvCategory}`);
-      if (wvDescription.trim()) parts.push(`描述: ${wvDescription}`);
-      if (wvTags.trim()) parts.push(`标签: ${wvTags}`);
-      content = parts.join('\n');
-    } else if (fieldType === 'writing_style') {
-      content = localStoryCfg.writing_style || '';
-    } else if (fieldType === 'story_synopsis') {
-      content = localStoryCfg.story_synopsis || '';
-    }
-
-    try {
-      const resp = await api('POST', '/api/settings/polish', { field_type: fieldType, content });
-      addToast('AI 润色中...', 'info');
-    } catch (e) {
-      polishingField = '';
-      addToast(e.message, 'error');
-    }
-  }
-
-  if (typeof window !== 'undefined') {
-    window.addEventListener('settings_polish_result', (e) => {
-      const { field_type, text } = e.detail;
-      polishingField = '';
-
-      if (field_type === 'writing_style') {
-        localStoryCfg.writing_style = text;
-        addToast('写作风格已润色', 'success');
-      } else if (field_type === 'story_synopsis') {
-        localStoryCfg.story_synopsis = text;
-        addToast('故事梗概已润色', 'success');
-      } else if (field_type === 'character') {
-        try {
-          const obj = JSON.parse(text);
-          if (obj.name) charName = obj.name;
-          if (obj.age) charAge = obj.age;
-          if (obj.appearance) charAppearance = obj.appearance;
-          if (obj.personality) charPersonality = obj.personality;
-          if (obj.background) charBackground = obj.background;
-          if (obj.motivation) charMotivation = obj.motivation;
-          if (obj.abilities) charAbilities = obj.abilities;
-          if (obj.notes) charNotes = obj.notes;
-          addToast('角色已润色', 'success');
-        } catch {
-          addToast('AI 润色完成，但返回格式异常，请手动查看', 'warn');
-        }
-      } else if (field_type === 'worldview') {
-        try {
-          const obj = JSON.parse(text);
-          if (obj.name) wvName = obj.name;
-          if (obj.category) wvCategory = obj.category;
-          if (obj.description) wvDescription = obj.description;
-          if (obj.tags) wvTags = obj.tags;
-          addToast('世界观已润色', 'success');
-        } catch {
-          addToast('AI 润色完成，但返回格式异常，请手动查看', 'warn');
-        }
-      }
+  async function deleteRelation(id) {
+    showConfirm('确认删除此关系？', async () => {
+      try {
+        await api('DELETE', '/api/relations/' + id);
+        addToast('关系已删除', 'success');
+        settings.set(await api('GET', '/api/settings'));
+      } catch (e) { addToast(e.message, 'error'); }
     });
   }
 </script>
@@ -259,59 +340,59 @@
   <div class="grid grid-cols-2 gap-3">
     <div class="card bg-base-200 shadow-sm">
       <div class="card-body p-4 gap-2">
-        <h3 class="card-title text-sm">API 配置</h3>
+        <h3 class="card-title text-base">API 配置</h3>
         <div class="grid grid-cols-2 gap-x-3 gap-y-1.5">
           <div class="col-span-2">
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">API Base URL</label>
-            <input type="text" class="input input-sm w-full" bind:value={localApiCfg.base_url} placeholder="https://api.example.com/v1/" />
+            <label class="text-xs text-base-content/50 mb-0.5 block">API Base URL</label>
+            <input type="text" class="input input-sm w-full" bind:value={localApiCfg.base_url} placeholder="https://api.example.com/v1/" disabled={$taskRunning} />
           </div>
           <div>
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">Model</label>
-            <input type="text" class="input input-sm w-full" bind:value={localApiCfg.model} placeholder="gpt-4" />
+            <label class="text-xs text-base-content/50 mb-0.5 block">Model</label>
+            <input type="text" class="input input-sm w-full" bind:value={localApiCfg.model} placeholder="gpt-4" disabled={$taskRunning} />
           </div>
           <div>
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">HTTP 超时（秒）</label>
-            <input type="number" class="input input-sm w-full" bind:value={localApiCfg.http_timeout_seconds} />
+            <label class="text-xs text-base-content/50 mb-0.5 block">HTTP 超时（秒）</label>
+            <input type="number" class="input input-sm w-full" bind:value={localApiCfg.http_timeout_seconds} disabled={$taskRunning} />
           </div>
           <div class="col-span-2">
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">API Key</label>
-            <input type="password" class="input input-sm w-full" bind:value={localApiCfg.api_key} placeholder="sk-..." />
+            <label class="text-xs text-base-content/50 mb-0.5 block">API Key</label>
+            <input type="password" class="input input-sm w-full" bind:value={localApiCfg.api_key} placeholder="sk-..." disabled={$taskRunning} />
           </div>
         </div>
         <div class="flex justify-end">
-          <button class="btn btn-primary btn-xs" on:click={saveAPIConfig}>保存</button>
+          <button class="btn btn-primary btn-xs" on:click={saveAPIConfig} disabled={$taskRunning}>保存</button>
         </div>
       </div>
     </div>
 
     <div class="card bg-base-200 shadow-sm">
       <div class="card-body p-4 gap-2">
-        <h3 class="card-title text-sm">故事配置</h3>
+        <h3 class="card-title text-base">故事配置</h3>
         {#if hasAccepted}
           <div class="alert alert-warning text-xs py-1.5 px-3">
-            <span>已有已确认章节，保存后将自动协调设定兼容性。</span>
+            <span>已有已确认章节，修改关键设定后建议执行设定协调。</span>
           </div>
         {/if}
         <div class="grid grid-cols-2 gap-x-3 gap-y-1.5">
           <div>
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">故事类型</label>
-            <input type="text" class="input input-sm w-full" bind:value={localStoryCfg.type} placeholder="奇幻/都市/科幻..." />
+            <label class="text-xs text-base-content/50 mb-0.5 block">故事类型</label>
+            <input type="text" class="input input-sm w-full" bind:value={localStoryCfg.type} placeholder="奇幻/都市/科幻..." disabled={$taskRunning} />
           </div>
           <div>
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">小说标题（留空由 AI 生成）</label>
-            <input type="text" class="input input-sm w-full" bind:value={localStoryCfg.title} placeholder="留空则 AI 自动生成" />
+            <label class="text-xs text-base-content/50 mb-0.5 block">小说标题（留空由 AI 生成）</label>
+            <input type="text" class="input input-sm w-full" bind:value={localStoryCfg.title} placeholder="留空则 AI 自动生成" disabled={$taskRunning} />
           </div>
           <div>
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">章节数量</label>
-            <input type="number" class="input input-sm w-full" bind:value={localStoryCfg.chapter_count} />
+            <label class="text-xs text-base-content/50 mb-0.5 block">章节数量</label>
+            <input type="number" class="input input-sm w-full" bind:value={localStoryCfg.chapter_count} disabled={$taskRunning} />
           </div>
           <div>
-            <label class="text-[11px] text-base-content/50 mb-0.5 block">每章目标字数</label>
-            <input type="number" class="input input-sm w-full" bind:value={localStoryCfg.target_words_per_chapter} />
+            <label class="text-xs text-base-content/50 mb-0.5 block">每章目标字数</label>
+            <input type="number" class="input input-sm w-full" bind:value={localStoryCfg.target_words_per_chapter} disabled={$taskRunning} />
           </div>
         </div>
         <div class="flex justify-end">
-          <button class="btn btn-primary btn-xs" on:click={saveStoryConfig}>保存</button>
+          <button class="btn btn-primary btn-xs" on:click={saveStoryConfig} disabled={$taskRunning}>保存</button>
         </div>
       </div>
     </div>
@@ -320,26 +401,22 @@
   <!-- Writing Style -->
   <div class="card bg-base-200 shadow-sm">
     <div class="card-body p-4 gap-2">
-      <div class="flex items-center justify-between">
-        <h3 class="card-title text-sm">写作风格</h3>
-        <button class="btn btn-accent btn-xs" class:loading={polishingField === 'writing_style'} disabled={polishingField !== ''} on:click={() => polishField('writing_style')}>
-          {polishingField === 'writing_style' ? '润色中...' : 'AI 润色'}
-        </button>
+      <h3 class="card-title text-base">写作风格</h3>
+      <textarea class="textarea w-full h-40 text-base" bind:value={localStoryCfg.writing_style} placeholder="描述你期望的写作风格..." disabled={$taskRunning}></textarea>
+      <div class="flex justify-end">
+        <button class="btn btn-primary btn-xs" on:click={saveStoryConfig} disabled={$taskRunning}>保存</button>
       </div>
-      <textarea class="textarea w-full h-40 text-sm" bind:value={localStoryCfg.writing_style} placeholder="描述你期望的写作风格..."></textarea>
     </div>
   </div>
 
   <!-- Story Synopsis -->
   <div class="card bg-base-200 shadow-sm">
     <div class="card-body p-4 gap-2">
-      <div class="flex items-center justify-between">
-        <h3 class="card-title text-sm">故事梗概</h3>
-        <button class="btn btn-accent btn-xs" class:loading={polishingField === 'story_synopsis'} disabled={polishingField !== ''} on:click={() => polishField('story_synopsis')}>
-          {polishingField === 'story_synopsis' ? '润色中...' : 'AI 润色'}
-        </button>
+      <h3 class="card-title text-base">故事梗概</h3>
+      <textarea class="textarea w-full h-40 text-base" bind:value={localStoryCfg.story_synopsis} placeholder="可包含：故事主线走向、核心冲突、关键转折点..." disabled={$taskRunning}></textarea>
+      <div class="flex justify-end">
+        <button class="btn btn-primary btn-xs" on:click={saveStoryConfig} disabled={$taskRunning}>保存</button>
       </div>
-      <textarea class="textarea w-full h-40 text-sm" bind:value={localStoryCfg.story_synopsis} placeholder="可包含：故事主线走向、核心冲突、关键转折点..."></textarea>
     </div>
   </div>
 
@@ -349,7 +426,7 @@
       <!-- svelte-ignore a11y-click-events-have-key-events -->
       <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div class="flex justify-between items-center cursor-pointer select-none" on:click={() => charCollapse = !charCollapse}>
-        <h3 class="card-title text-sm">角色管理 <span class="text-xs font-normal text-base-content/40">({chars.length})</span></h3>
+        <h3 class="card-title text-base">角色管理 <span class="text-xs font-normal text-base-content/40">({chars.length})</span></h3>
         <svg class="w-4 h-4 text-base-content/40 transition-transform" class:rotate-180={charCollapse} viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
       </div>
       {#if !charCollapse}
@@ -362,11 +439,11 @@
                 <div class="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center text-xs font-bold shrink-0">{c.name[0]}</div>
                 <div class="flex-1 min-w-0">
                   <div class="text-sm font-medium truncate">{c.name}</div>
-                  <div class="text-[11px] text-base-content/40 line-clamp-1">{c.personality || c.background || c.age || ''}</div>
+                  <div class="text-xs text-base-content/40 line-clamp-1">{c.personality || c.background || c.age || ''}</div>
                 </div>
                 <div class="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-                  <button class="btn btn-ghost btn-xs px-1" on:click={() => openCharForm(c)}>编辑</button>
-                  <button class="btn btn-ghost btn-xs px-1 text-error" on:click={() => deleteCharacter(c.id)}>删除</button>
+                  <button class="btn btn-ghost btn-xs px-1" on:click={() => openCharForm(c)} disabled={$taskRunning}>编辑</button>
+                  <button class="btn btn-ghost btn-xs px-1 text-error" on:click={() => deleteCharacter(c.id)} disabled={$taskRunning}>删除</button>
                 </div>
               </div>
             {/each}
@@ -377,53 +454,52 @@
           <div class="bg-base-300 rounded-lg p-3 space-y-2 mt-1">
             <div class="grid grid-cols-2 gap-x-3 gap-y-1.5">
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">名称</label>
-                <input type="text" class="input input-sm w-full" bind:value={charName} />
+                <label class="text-xs text-base-content/50 mb-0.5 block">名称</label>
+                <input type="text" class="input input-sm w-full" bind:value={charName} disabled={$taskRunning} />
               </div>
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">年龄</label>
-                <input type="text" class="input input-sm w-full" bind:value={charAge} />
+                <label class="text-xs text-base-content/50 mb-0.5 block">年龄</label>
+                <input type="text" class="input input-sm w-full" bind:value={charAge} disabled={$taskRunning} />
               </div>
             </div>
             <div class="grid grid-cols-2 gap-x-3 gap-y-1.5">
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">外貌</label>
-                <textarea class="textarea textarea-sm w-full h-14" bind:value={charAppearance}></textarea>
+                <label class="text-xs text-base-content/50 mb-0.5 block">外貌</label>
+                <textarea class="textarea textarea-sm w-full h-14 text-sm" bind:value={charAppearance} disabled={$taskRunning}></textarea>
               </div>
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">性格</label>
-                <textarea class="textarea textarea-sm w-full h-14" bind:value={charPersonality}></textarea>
+                <label class="text-xs text-base-content/50 mb-0.5 block">性格</label>
+                <textarea class="textarea textarea-sm w-full h-14 text-sm" bind:value={charPersonality} disabled={$taskRunning}></textarea>
               </div>
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">背景</label>
-                <textarea class="textarea textarea-sm w-full h-14" bind:value={charBackground}></textarea>
+                <label class="text-xs text-base-content/50 mb-0.5 block">背景</label>
+                <textarea class="textarea textarea-sm w-full h-14 text-sm" bind:value={charBackground} disabled={$taskRunning}></textarea>
               </div>
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">动机</label>
-                <textarea class="textarea textarea-sm w-full h-14" bind:value={charMotivation}></textarea>
+                <label class="text-xs text-base-content/50 mb-0.5 block">动机</label>
+                <textarea class="textarea textarea-sm w-full h-14 text-sm" bind:value={charMotivation} disabled={$taskRunning}></textarea>
               </div>
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">能力</label>
-                <textarea class="textarea textarea-sm w-full h-14" bind:value={charAbilities}></textarea>
+                <label class="text-xs text-base-content/50 mb-0.5 block">能力</label>
+                <textarea class="textarea textarea-sm w-full h-14 text-sm" bind:value={charAbilities} disabled={$taskRunning}></textarea>
               </div>
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">备注</label>
-                <textarea class="textarea textarea-sm w-full h-14" bind:value={charNotes}></textarea>
+                <label class="text-xs text-base-content/50 mb-0.5 block">备注</label>
+                <textarea class="textarea textarea-sm w-full h-14 text-sm" bind:value={charNotes} disabled={$taskRunning}></textarea>
               </div>
             </div>
             <div class="flex gap-1.5">
-              <button class="btn btn-success btn-xs" on:click={saveCharacter}>保存角色</button>
-              <button class="btn btn-accent btn-xs" class:loading={polishingField === 'character'} disabled={polishingField !== ''} on:click={() => polishField('character')}>
-                {polishingField === 'character' ? '润色中...' : 'AI 润色'}
-              </button>
+              <button class="btn btn-success btn-xs" on:click={saveCharacter} disabled={$taskRunning}>保存角色</button>
               <button class="btn btn-ghost btn-xs" on:click={closeCharForm}>取消</button>
             </div>
           </div>
         {/if}
 
         <div class="flex gap-1.5">
-          <button class="btn btn-primary btn-xs" on:click={() => openCharForm(null)}>新建角色</button>
-          <button class="btn btn-ghost btn-xs" on:click={aiGenerateSettings}>AI 自动生成</button>
+          <button class="btn btn-primary btn-xs" on:click={() => openCharForm(null)} disabled={$taskRunning}>新建角色</button>
+          {#if chars.length > 0}
+            <button class="btn btn-accent btn-xs" on:click={submitCharacters} disabled={$taskRunning}>提交角色设定给 AI</button>
+          {/if}
         </div>
       {/if}
     </div>
@@ -435,7 +511,7 @@
       <!-- svelte-ignore a11y-click-events-have-key-events -->
       <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div class="flex justify-between items-center cursor-pointer select-none" on:click={() => wvCollapse = !wvCollapse}>
-        <h3 class="card-title text-sm">世界观管理 <span class="text-xs font-normal text-base-content/40">({filteredWvs.length})</span></h3>
+        <h3 class="card-title text-base">世界观管理 <span class="text-xs font-normal text-base-content/40">({filteredWvs.length})</span></h3>
         <svg class="w-4 h-4 text-base-content/40 transition-transform" class:rotate-180={wvCollapse} viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
       </div>
       {#if !wvCollapse}
@@ -455,12 +531,12 @@
               <div class="flex items-start gap-2.5 bg-base-300 rounded-lg p-2.5 group">
                 <div class="w-8 h-8 rounded-lg bg-accent/20 text-accent flex items-center justify-center text-xs font-bold shrink-0">{w.name[0]}</div>
                 <div class="flex-1 min-w-0">
-                  <div class="text-sm font-medium truncate">{w.name} <span class="text-[10px] font-normal text-base-content/30">[{catLabels[w.category] || w.category}]</span></div>
-                  <div class="text-[11px] text-base-content/40 line-clamp-1">{w.description}</div>
+                  <div class="text-sm font-medium truncate">{w.name} <span class="text-xs font-normal text-base-content/30">[{catLabels[w.category] || w.category}]</span></div>
+                  <div class="text-xs text-base-content/40 line-clamp-1">{w.description}</div>
                 </div>
                 <div class="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-                  <button class="btn btn-ghost btn-xs px-1" on:click={() => openWvForm(w)}>编辑</button>
-                  <button class="btn btn-ghost btn-xs px-1 text-error" on:click={() => deleteWorldview(w.id)}>删除</button>
+                  <button class="btn btn-ghost btn-xs px-1" on:click={() => openWvForm(w)} disabled={$taskRunning}>编辑</button>
+                  <button class="btn btn-ghost btn-xs px-1 text-error" on:click={() => deleteWorldview(w.id)} disabled={$taskRunning}>删除</button>
                 </div>
               </div>
             {/each}
@@ -471,12 +547,12 @@
           <div class="bg-base-300 rounded-lg p-3 space-y-2 mt-1">
             <div class="grid grid-cols-2 gap-x-3 gap-y-1.5">
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">名称</label>
-                <input type="text" class="input input-sm w-full" bind:value={wvName} />
+                <label class="text-xs text-base-content/50 mb-0.5 block">名称</label>
+                <input type="text" class="input input-sm w-full" bind:value={wvName} disabled={$taskRunning} />
               </div>
               <div>
-                <label class="text-[11px] text-base-content/50 mb-0.5 block">分类</label>
-                <select class="select select-sm w-full" bind:value={wvCategory}>
+                <label class="text-xs text-base-content/50 mb-0.5 block">分类</label>
+                <select class="select select-sm w-full" bind:value={wvCategory} disabled={$taskRunning}>
                   <option value="geography">地理</option>
                   <option value="faction">势力</option>
                   <option value="rule">规则</option>
@@ -486,25 +562,176 @@
               </div>
             </div>
             <div>
-              <label class="text-[11px] text-base-content/50 mb-0.5 block">描述</label>
-              <textarea class="textarea textarea-sm w-full h-16" bind:value={wvDescription}></textarea>
+              <label class="text-xs text-base-content/50 mb-0.5 block">描述</label>
+              <textarea class="textarea textarea-sm w-full h-16 text-sm" bind:value={wvDescription} disabled={$taskRunning}></textarea>
             </div>
             <div>
-              <label class="text-[11px] text-base-content/50 mb-0.5 block">标签</label>
-              <input type="text" class="input input-sm w-full" bind:value={wvTags} placeholder="逗号分隔" />
+              <label class="text-xs text-base-content/50 mb-0.5 block">标签</label>
+              <input type="text" class="input input-sm w-full" bind:value={wvTags} placeholder="逗号分隔" disabled={$taskRunning} />
             </div>
             <div class="flex gap-1.5">
-              <button class="btn btn-success btn-xs" on:click={saveWorldview}>保存</button>
-              <button class="btn btn-accent btn-xs" class:loading={polishingField === 'worldview'} disabled={polishingField !== ''} on:click={() => polishField('worldview')}>
-                {polishingField === 'worldview' ? '润色中...' : 'AI 润色'}
-              </button>
+              <button class="btn btn-success btn-xs" on:click={saveWorldview} disabled={$taskRunning}>保存</button>
               <button class="btn btn-ghost btn-xs" on:click={closeWvForm}>取消</button>
             </div>
           </div>
         {/if}
 
-        <div>
-          <button class="btn btn-primary btn-xs" on:click={() => openWvForm(null)}>新建世界观条目</button>
+        <div class="flex gap-1.5">
+          <button class="btn btn-primary btn-xs" on:click={() => openWvForm(null)} disabled={$taskRunning}>新建世界观条目</button>
+          {#if allWvs.length > 0}
+            <button class="btn btn-accent btn-xs" on:click={submitWorldview} disabled={$taskRunning}>提交世界观设定给 AI</button>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  </div>
+
+  <!-- Organizations -->
+  <div class="card bg-base-200 shadow-sm">
+    <div class="card-body p-4 gap-2">
+      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
+      <div class="flex justify-between items-center cursor-pointer select-none" on:click={() => orgCollapse = !orgCollapse}>
+        <h3 class="card-title text-base">组织管理 <span class="text-xs font-normal text-base-content/40">({orgs.length})</span></h3>
+        <svg class="w-4 h-4 text-base-content/40 transition-transform" class:rotate-180={orgCollapse} viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
+      </div>
+      {#if !orgCollapse}
+        <div class="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2">
+          {#if orgs.length === 0}
+            <p class="text-xs text-base-content/40 col-span-full py-2">暂无组织，点击下方按钮创建。</p>
+          {:else}
+            {#each orgs as o}
+              <div class="flex items-start gap-2.5 bg-base-300 rounded-lg p-2.5 group">
+                <div class="w-8 h-8 rounded-lg bg-warning/20 text-warning flex items-center justify-center text-xs font-bold shrink-0">{o.name[0]}</div>
+                <div class="flex-1 min-w-0">
+                  <div class="text-sm font-medium truncate">{o.name} {#if o.type}<span class="text-xs font-normal text-base-content/30">[{o.type}]</span>{/if}</div>
+                  <div class="text-xs text-base-content/40 line-clamp-1">{o.description || ''}</div>
+                  {#if (o.members || []).length > 0}
+                    <div class="text-xs text-base-content/35 line-clamp-1 mt-0.5">成员：{(o.members || []).map(id => nameById[id] || id).join('、')}</div>
+                  {/if}
+                </div>
+                <div class="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                  <button class="btn btn-ghost btn-xs px-1" on:click={() => openOrgForm(o)} disabled={$taskRunning}>编辑</button>
+                  <button class="btn btn-ghost btn-xs px-1 text-error" on:click={() => deleteOrganization(o.id)} disabled={$taskRunning}>删除</button>
+                </div>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        {#if showOrgForm}
+          <div class="bg-base-300 rounded-lg p-3 space-y-2 mt-1">
+            <div class="grid grid-cols-2 gap-x-3 gap-y-1.5">
+              <div>
+                <label class="text-xs text-base-content/50 mb-0.5 block">名称</label>
+                <input type="text" class="input input-sm w-full" bind:value={orgName} disabled={$taskRunning} />
+              </div>
+              <div>
+                <label class="text-xs text-base-content/50 mb-0.5 block">类型</label>
+                <input type="text" class="input input-sm w-full" bind:value={orgType} placeholder="宗门/帮派/公司/家族..." disabled={$taskRunning} />
+              </div>
+            </div>
+            <div>
+              <label class="text-xs text-base-content/50 mb-0.5 block">描述</label>
+              <textarea class="textarea textarea-sm w-full h-16 text-sm" bind:value={orgDescription} disabled={$taskRunning}></textarea>
+            </div>
+            {#if chars.length > 0}
+              <div>
+                <label class="text-xs text-base-content/50 mb-0.5 block">成员（从角色中选择）</label>
+                <div class="flex flex-wrap gap-x-3 gap-y-1">
+                  {#each chars as c}
+                    <label class="flex items-center gap-1 cursor-pointer text-sm">
+                      <input type="checkbox" class="checkbox checkbox-xs" bind:group={orgMembers} value={c.id} disabled={$taskRunning} />
+                      {c.name}
+                    </label>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            <div class="flex gap-1.5">
+              <button class="btn btn-success btn-xs" on:click={saveOrganization} disabled={$taskRunning}>保存组织</button>
+              <button class="btn btn-ghost btn-xs" on:click={closeOrgForm}>取消</button>
+            </div>
+          </div>
+        {/if}
+
+        <div class="flex gap-1.5">
+          <button class="btn btn-primary btn-xs" on:click={() => openOrgForm(null)} disabled={$taskRunning}>新建组织</button>
+        </div>
+      {/if}
+    </div>
+  </div>
+
+  <!-- Relations -->
+  <div class="card bg-base-200 shadow-sm">
+    <div class="card-body p-4 gap-2">
+      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
+      <div class="flex justify-between items-center cursor-pointer select-none" on:click={() => relCollapse = !relCollapse}>
+        <h3 class="card-title text-base">关系管理 <span class="text-xs font-normal text-base-content/40">({rels.length})</span></h3>
+        <svg class="w-4 h-4 text-base-content/40 transition-transform" class:rotate-180={relCollapse} viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
+      </div>
+      {#if !relCollapse}
+        <div class="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-2">
+          {#if rels.length === 0}
+            <p class="text-xs text-base-content/40 col-span-full py-2">暂无关系。关系会在「图谱」页以连线展示。</p>
+          {:else}
+            {#each rels as r}
+              <div class="flex items-center gap-2 bg-base-300 rounded-lg p-2.5 group">
+                <div class="flex-1 min-w-0 text-sm flex items-center gap-1.5 flex-wrap">
+                  <span class="font-medium">{entityIcons[r.source_type] || ''} {nameById[r.source_id] || r.source_id}</span>
+                  <span class="badge badge-xs badge-secondary">{r.label}</span>
+                  <span class="text-base-content/40">→</span>
+                  <span class="font-medium">{entityIcons[r.target_type] || ''} {nameById[r.target_id] || r.target_id}</span>
+                </div>
+                <div class="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                  <button class="btn btn-ghost btn-xs px-1" on:click={() => openRelForm(r)} disabled={$taskRunning}>编辑</button>
+                  <button class="btn btn-ghost btn-xs px-1 text-error" on:click={() => deleteRelation(r.id)} disabled={$taskRunning}>删除</button>
+                </div>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        {#if showRelForm}
+          <div class="bg-base-300 rounded-lg p-3 space-y-2 mt-1">
+            <div class="grid grid-cols-[1fr_auto_1fr] gap-2 items-end">
+              <div>
+                <label class="text-xs text-base-content/50 mb-0.5 block">源（谁）</label>
+                <select class="select select-sm w-full" bind:value={relSource} disabled={$taskRunning}>
+                  <option value="" disabled>选择实体...</option>
+                  {#each entityOptions as opt}
+                    <option value={opt.key}>{opt.label}</option>
+                  {/each}
+                </select>
+              </div>
+              <span class="text-base-content/40 pb-1.5">→</span>
+              <div>
+                <label class="text-xs text-base-content/50 mb-0.5 block">目标（对谁）</label>
+                <select class="select select-sm w-full" bind:value={relTarget} disabled={$taskRunning}>
+                  <option value="" disabled>选择实体...</option>
+                  {#each entityOptions as opt}
+                    <option value={opt.key}>{opt.label}</option>
+                  {/each}
+                </select>
+              </div>
+            </div>
+            <div>
+              <label class="text-xs text-base-content/50 mb-0.5 block">关系描述</label>
+              <input type="text" class="input input-sm w-full" bind:value={relLabel} placeholder="师徒 / 仇敌 / 恋人 / 隶属于..." disabled={$taskRunning} />
+            </div>
+            <div class="flex gap-1.5">
+              <button class="btn btn-success btn-xs" on:click={saveRelation} disabled={$taskRunning}>保存关系</button>
+              <button class="btn btn-ghost btn-xs" on:click={closeRelForm}>取消</button>
+            </div>
+          </div>
+        {/if}
+
+        <div class="flex gap-1.5">
+          <button class="btn btn-primary btn-xs" on:click={() => openRelForm(null)} disabled={$taskRunning || entityOptions.length < 2}>新建关系</button>
+          {#if entityOptions.length < 2}
+            <span class="text-xs text-base-content/35 self-center">至少需要 2 个实体（角色/组织/世界观条目）才能创建关系</span>
+          {/if}
         </div>
       {/if}
     </div>

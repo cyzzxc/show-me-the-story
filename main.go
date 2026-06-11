@@ -11,52 +11,39 @@ const (
 )
 
 func main() {
-	projectDir := "."
+	// Determine program directory (progDir)
+	// Priority: os.Args[1] if it's a valid existing directory, otherwise use cwd
+	progDir := ""
+
 	if len(os.Args) > 1 {
-		projectDir = os.Args[1]
-	}
-
-	absDir, err := filepath.Abs(projectDir)
-	if err != nil {
-		fmt.Printf(" [错误] 无法解析项目目录: %v\n", err)
-		os.Exit(1)
-	}
-	projectDir = absDir
-
-	if info, err := os.Stat(projectDir); err != nil || !info.IsDir() {
-		fmt.Printf(" [错误] 项目目录不存在或不是目录: %s\n", projectDir)
-		os.Exit(1)
-	}
-
-	progressPath := filepath.Join(projectDir, "progress.json")
-	configPath := filepath.Join(projectDir, "config.json")
-	settingsPath := filepath.Join(projectDir, "settings.json")
-	sessionsDir := filepath.Join(projectDir, "sessions")
-
-	apiCfgPath := filepath.Join(projectDir, "api.json")
-	if _, err := os.Stat(apiCfgPath); os.IsNotExist(err) {
-		exePath, err := os.Executable()
+		absDir, err := filepath.Abs(os.Args[1])
 		if err == nil {
-			globalPath := filepath.Join(filepath.Dir(exePath), "api.json")
-			if _, err := os.Stat(globalPath); err == nil {
-				apiCfgPath = globalPath
+			if info, err := os.Stat(absDir); err == nil && info.IsDir() {
+				progDir = absDir
 			}
 		}
 	}
 
-	os.MkdirAll(sessionsDir, 0755)
+	if progDir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Printf(" [错误] 无法获取当前目录: %v\n", err)
+			os.Exit(1)
+		}
+		progDir = cwd
+	}
 
-	fmt.Printf(" [系统] 项目目录: %s\n", projectDir)
+	// Create storys directory
+	storysDir := filepath.Join(progDir, "storys")
+	os.MkdirAll(storysDir, 0755)
 
+	// API config: always in progDir
+	apiCfgPath := filepath.Join(progDir, "api.json")
+
+	// Load API config (global, shared across projects)
 	apiCfg, err := LoadAPIConfig(apiCfgPath)
 	if err != nil {
 		fmt.Printf(" [错误] 加载API配置失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	cfg, err := LoadConfig(configPath)
-	if err != nil {
-		fmt.Printf(" [错误] 加载配置失败: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -65,28 +52,13 @@ func main() {
 		fmt.Println(" [系统] 请通过 Web UI 配置 API 地址和模型后再使用")
 	}
 
-	state, err := LoadProgress(progressPath)
-	if err != nil {
-		fmt.Printf(" [错误] 加载进度文件失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	if state == nil {
-		fmt.Println(" [系统] 未检测到历史进度，开始全新的创作流程...")
-		state = &Progress{
-			Phase: "outline",
-		}
-	} else {
-		fmt.Printf(" [系统] 检测到历史进度，当前阶段: %s\n", state.Phase)
-	}
-
-	settings, err := LoadProjectSettings(settingsPath)
-	if err != nil {
-		fmt.Printf(" [错误] 加载设定失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	skills := LoadAllSkills(cfg, projectDir)
+	// Start with no project selected
+	cfg := DefaultConfig()
+	state := &Progress{Phase: "outline"}
+	settings := &ProjectSettings{}
+	skills := LoadAllSkills(cfg, progDir)
+	sessionsDir := filepath.Join(progDir, "sessions")
+	os.MkdirAll(sessionsDir, 0755)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -98,5 +70,8 @@ func main() {
 	logger := NewLogBroadcaster()
 	defer logger.Close()
 
-	startWebServer(apiCfg, apiCfgPath, cfg, configPath, state, progressPath, settings, settingsPath, skills, sessionsDir, logger, port, projectDir)
+	fmt.Printf(" [系统] 程序目录: %s\n", progDir)
+	fmt.Printf(" [系统] 项目目录: %s\n", storysDir)
+
+	startWebServer(apiCfg, apiCfgPath, cfg, state, settings, skills, sessionsDir, logger, port, progDir)
 }

@@ -31,6 +31,7 @@ type StoryConfig struct {
 type PromptsConfig struct {
 	OutlineGeneration             string `json:"outline_generation"`
 	ChapterWriting                string `json:"chapter_writing"`
+	ChapterRevision               string `json:"chapter_revision"`
 	ChapterSummary                string `json:"chapter_summary"`
 	FactCheck                     string `json:"fact_check"`
 	OutlineRevision               string `json:"outline_revision"`
@@ -39,6 +40,7 @@ type PromptsConfig struct {
 	ContentAnalysis               string `json:"content_analysis"`
 	ContinuationOutlineGeneration string `json:"continuation_outline_generation"`
 	SettingsReconciliation        string `json:"settings_reconciliation"`
+	TransitionSmoothing           string `json:"transition_smoothing"`
 }
 
 func DefaultAPIConfig() *APIConfig {
@@ -147,6 +149,9 @@ func (p *PromptsConfig) applyDefaults() {
 	if p.ChapterWriting == "" {
 		p.ChapterWriting = DefaultPrompts.ChapterWriting
 	}
+	if p.ChapterRevision == "" {
+		p.ChapterRevision = DefaultPrompts.ChapterRevision
+	}
 	if p.ChapterSummary == "" {
 		p.ChapterSummary = DefaultPrompts.ChapterSummary
 	}
@@ -170,5 +175,8 @@ func (p *PromptsConfig) applyDefaults() {
 	}
 	if p.SettingsReconciliation == "" {
 		p.SettingsReconciliation = DefaultPrompts.SettingsReconciliation
+	}
+	if p.TransitionSmoothing == "" {
+		p.TransitionSmoothing = DefaultPrompts.TransitionSmoothing
 	}
 }
