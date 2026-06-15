@@ -54,6 +54,14 @@ func startWebServer(apiCfg *APIConfig, apiCfgPath string, cfg *Config, state *Pr
 	mux.HandleFunc("POST /api/chapter/revise/{num}", h.PostChapterReviseSpecific)
 	mux.HandleFunc("POST /api/chapter/polish", h.PostChapterPolish)
 	mux.HandleFunc("POST /api/chapters/smooth-transitions", h.PostChaptersSmoothTransitions)
+
+	mux.HandleFunc("GET /api/postprocess", h.GetPostProcess)
+	mux.HandleFunc("DELETE /api/postprocess", h.DeletePostProcess)
+	mux.HandleFunc("PUT /api/postprocess/roadmap", h.PutPostProcessRoadmap)
+	mux.HandleFunc("POST /api/postprocess/diagnose", h.PostPostProcessDiagnose)
+	mux.HandleFunc("POST /api/postprocess/consistency", h.PostPostProcessConsistency)
+	mux.HandleFunc("POST /api/postprocess/roadmap", h.PostPostProcessRoadmap)
+	mux.HandleFunc("POST /api/postprocess/execute", h.PostPostProcessExecute)
 	mux.HandleFunc("DELETE /api/chapter", h.DeleteChapter)
 	mux.HandleFunc("DELETE /api/chapters/from/{num}", h.DeleteChaptersFrom)
 	mux.HandleFunc("DELETE /api/outline", h.DeleteOutline)
@@ -85,6 +93,7 @@ func startWebServer(apiCfg *APIConfig, apiCfgPath string, cfg *Config, state *Pr
 	mux.HandleFunc("DELETE /api/relations/{id}", h.DeleteRelation)
 
 	mux.HandleFunc("GET /api/foreshadows", h.GetForeshadows)
+	mux.HandleFunc("GET /api/foreshadows/roadmap", h.GetForeshadowsRoadmap)
 	mux.HandleFunc("POST /api/foreshadows/suggest", h.PostForeshadowsSuggest)
 	mux.HandleFunc("POST /api/foreshadows/confirm", h.PostForeshadowsConfirm)
 	mux.HandleFunc("POST /api/foreshadows", h.PostForeshadow)

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '../lib/api.js';
   import { progress, taskRunning, streamingContent, streamingChapterIdx, streamCharCount, selectedChapter, autoConfirm, addToast, confirmModal } from '../lib/stores.js';
+  import PostProcessPanel from '../components/PostProcessPanel.svelte';
 
   // 保留 prop 以兼容 App 传参
   export let sendToChat = async () => {};
@@ -10,6 +11,10 @@
     try {
       const res = await api('GET', '/api/autoconfirm');
       autoConfirm.set(!!res.enabled);
+    } catch (e) {}
+    try {
+      const sk = await api('GET', '/api/skills');
+      hasPolishSkills = (sk || []).some(s => s.enabled && s.skill?.category === 'polish');
     } catch (e) {}
   });
 
@@ -52,6 +57,13 @@
   $: wordCount = isStreamingThis ? $streamCharCount : (ch?.content ? ch.content.replace(/\s/g, '').length : 0);
   $: totalWords = chapters.reduce((sum, c) => sum + (c.content ? c.content.replace(/\s/g, '').length : 0), 0);
 
+  $: foreshadows = p?.foreshadows || [];
+  $: fsActive = foreshadows.filter(f => f.status === 'planted' || f.status === 'progressing');
+  $: fsOverdue = fsActive.filter(f => f.target_chapter > 0 && (currentIdx + 1) > f.target_chapter);
+  $: fsNearTarget = fsActive.filter(f =>
+    f.target_chapter > 0 && (currentIdx + 1) >= f.target_chapter - 2 && (currentIdx + 1) <= f.target_chapter
+  );
+
   const statusMeta = {
     pending:  { label: '待写作', cls: 'badge-ghost', dot: 'bg-base-content/20' },
     writing:  { label: '写作中', cls: 'badge-warning', dot: 'bg-warning animate-pulse' },
@@ -62,6 +74,7 @@
   let reviseFeedback = '';
   let showRevise = false;
   let contentEl;
+  let hasPolishSkills = false;
 
   // 流式输出时自动滚动到底部：合并到 rAF，每帧最多一次，避免高频强制重排
   let scrollPending = false;
@@ -116,6 +129,14 @@
       addToast(`第 ${ch.num} 章修订任务已启动（仅修改该章）`, 'info');
       reviseFeedback = '';
       showRevise = false;
+    } catch (e) { addToast(e.message, 'error'); }
+  }
+
+  async function doPolish() {
+    if (!ch) return;
+    try {
+      await api('POST', '/api/chapter/polish', { num: ch.num });
+      addToast(`第 ${ch.num} 章润色任务已启动`, 'info');
     } catch (e) { addToast(e.message, 'error'); }
   }
 
@@ -188,6 +209,41 @@
         <div class="text-sm text-base-content/50">{pct}%（已确认 {accepted} / {total} 章）</div>
       </div>
     </div>
+
+    {#if foreshadows.length > 0}
+      <div class="card bg-base-200 shadow-sm">
+        <div class="card-body p-4 gap-2">
+          <div class="flex items-center justify-between gap-2">
+            <h3 class="font-medium text-sm">伏笔追踪</h3>
+            <button class="btn btn-ghost btn-xs" on:click={() => window.location.hash = '#foreshadows'}>查看路线图 →</button>
+          </div>
+          <div class="flex flex-wrap gap-2 text-xs">
+            <span class="badge badge-ghost">共 {foreshadows.length} 条</span>
+            <span class="badge badge-info badge-outline">活跃 {fsActive.length}</span>
+            {#if fsOverdue.length > 0}
+              <span class="badge badge-error">超期 {fsOverdue.length}</span>
+            {/if}
+            {#if fsNearTarget.length > 0}
+              <span class="badge badge-warning badge-outline">临近回收 {fsNearTarget.length}</span>
+            {/if}
+          </div>
+          {#if fsOverdue.length > 0}
+            <p class="text-xs text-warning">⚠️ {fsOverdue.map(f => `#${f.id} ${f.name}`).join('、')} 已超过预计回收章节</p>
+          {:else if fsNearTarget.length > 0}
+            <p class="text-xs text-base-content/50">本章可优先考虑：{fsNearTarget.map(f => f.name).join('、')}</p>
+          {/if}
+        </div>
+      </div>
+    {:else}
+      <div class="card bg-base-200 shadow-sm">
+        <div class="card-body p-4 flex items-center justify-between gap-2">
+          <p class="text-sm text-base-content/50">尚未设置伏笔 — 写作时不会注入伏笔约束</p>
+          <button class="btn btn-ghost btn-xs" on:click={() => window.location.hash = '#foreshadows'}>去设置 →</button>
+        </div>
+      </div>
+    {/if}
+
+    <PostProcessPanel />
 
     <!-- 章节区 -->
     <div class="grid grid-cols-[230px_1fr] gap-3" style="min-height:400px">
@@ -269,6 +325,9 @@
                 {/if}
                 {#if ch.content && ch.status !== 'writing'}
                   <button class="btn btn-ghost btn-sm" on:click={() => showRevise = !showRevise} disabled={$taskRunning}>✏️ 修改本章</button>
+                  {#if hasPolishSkills}
+                    <button class="btn btn-ghost btn-sm" on:click={doPolish} disabled={$taskRunning} title="需启用 polish 类技能">✨ 去AI味</button>
+                  {/if}
                   <button class="btn btn-ghost btn-sm" on:click={copyContent}>📋 复制</button>
                 {/if}
                 <div class="flex-1"></div>
