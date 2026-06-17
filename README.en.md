@@ -181,3 +181,13 @@ task dev:frontend   # start the Vite dev server (:5173, HMR, proxies /api → :4
 The backend is a flat layer of Go files split by responsibility (`outline.go` for outlines, `writing.go` for chapter writing, `foreshadow.go` for foreshadows, `agent.go` for the assistant agent loop, `handlers.go` for HTTP routes, etc.). Frontend pages live under `frontend/src/pages/`.
 
 The full architecture, API endpoint list, SSE event reference, design patterns, and development guidelines are in [AGENTS.md](AGENTS.md).
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=Nigh%2Fshow-me-the-story&type=timeline&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Nigh/show-me-the-story&type=timeline&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Nigh/show-me-the-story&type=timeline&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Nigh/show-me-the-story&type=timeline&legend=top-left" />
+ </picture>
+</a>
