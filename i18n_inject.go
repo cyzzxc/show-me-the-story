@@ -119,7 +119,7 @@ func buildCharacterContextForLang(settings *ProjectSettings, chapterOutline, lan
 
 	var relevant []Character
 	for _, c := range settings.Characters {
-		if strings.Contains(chapterOutline, c.Name) {
+		if strings.Contains(chapterOutline, stripNameMarks(c.Name)) {
 			relevant = append(relevant, c)
 		}
 	}
