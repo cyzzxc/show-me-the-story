@@ -41,6 +41,13 @@ type Foreshadow struct {
 	Resolution    string            `json:"resolution"`
 }
 
+type ForeshadowSuggestion struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Plant       int    `json:"plant"`
+	Payoff      int    `json:"payoff"`
+}
+
 type ForeshadowOutlineConflict struct {
 	ForeshadowID   int    `json:"foreshadow_id"`
 	ForeshadowName string `json:"foreshadow_name"`

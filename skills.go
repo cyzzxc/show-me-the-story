@@ -211,19 +211,7 @@ func FormatSkillsContent(skills []Skill) string {
 	}
 
 	var sb strings.Builder
-	// Detect language from skill set: if any skill is explicitly EN, use EN header.
-	en := false
-	for _, s := range skills {
-		if s.Lang == LangEN {
-			en = true
-			break
-		}
-	}
-	if en {
-		sb.WriteString("Strictly follow the skill rules below while writing:\n\n")
-	} else {
-		sb.WriteString("以下技能规则在创作时必须严格遵守：\n\n")
-	}
+	sb.WriteString("以下技能规则在创作时必须严格遵守：\n\n")
 	for _, s := range skills {
 		sb.WriteString(fmt.Sprintf("## %s\n\n%s\n\n", s.Name, s.Content))
 	}

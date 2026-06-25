@@ -47,7 +47,7 @@ func ReconcileSettingsAction(ctx context.Context, apiCfg *APIConfig, cfg *Config
 		"ExistingSummaries": acceptedSummaries,
 	})
 
-	systemPrompt := SystemPromptFor(lang, "consistency_reviewer_json")
+	systemPrompt := SystemPromptFor("", "consistency_reviewer_json")
 
 	rawResp := CallAPIWithRetry(ctx, apiCfg, systemPrompt, userPrompt)
 	if rawResp == "" {
@@ -159,7 +159,7 @@ func regeneratePendingOutlines(ctx context.Context, apiCfg *APIConfig, cfg *Conf
 		"LockedChapters": lockedChapters,
 	})
 
-	systemPrompt := SystemPromptFor(lang, "outline_editor_locked_json")
+	systemPrompt := SystemPromptFor("", "outline_editor_locked_json")
 
 	rawResp := CallAPIWithRetry(ctx, apiCfg, systemPrompt, userPrompt)
 	if rawResp == "" {

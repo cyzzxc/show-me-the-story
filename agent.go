@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strings"
 )
 
@@ -238,7 +237,7 @@ func calcSynopsisLengthRange(chapterCount, targetWordsPerChapter int) (minLen, m
 
 func buildAgentSystemPromptZH(ctx *AgentContext, toolDesc string) string {
 	var sb strings.Builder
-	sb.WriteString("你是一个小说创作助手，全权负责管理小说项目的一切操作，包括：生成/修订/确认大纲、生成/修订/确认章节、管理角色/世界观/组织/关系/伏笔、技能管理、项目配置等。\n\n")
+	sb.WriteString("你是一个小说创作助手，全权负责管理小说项目的一切操作，包括：生成/修订/确认大纲、生成/修订/确认章节、管理角色/世界观/组织/关系、技能管理、项目配置等。\n\n")
 
 	sb.WriteString("## 项目信息\n")
 	if ctx.State.Title != "" {
@@ -344,7 +343,7 @@ func buildAgentSystemPromptZH(ctx *AgentContext, toolDesc string) string {
 
 func buildAgentSystemPromptEN(ctx *AgentContext, toolDesc string) string {
 	var sb strings.Builder
-	sb.WriteString("You are a novel-writing assistant in full charge of every operation on the project: generating/revising/confirming outlines, generating/revising/confirming chapters, managing characters/worldview/organisations/relations/foreshadows, skill management, project configuration, and so on. Reply to the user in English.\n\n")
+	sb.WriteString("You are a novel-writing assistant in full charge of every operation on the project: generating/revising/confirming outlines, generating/revising/confirming chapters, managing characters/worldview/organisations/relations, skill management, project configuration, and so on. Reply to the user in English.\n\n")
 
 	sb.WriteString("## Project info\n")
 	if ctx.State.Title != "" {
@@ -860,38 +859,6 @@ func getBuiltinTools() []Tool {
 						status = "⏳"
 					}
 					result.WriteString(fmt.Sprintf("第%d章 %s《%s》: %s\n", ch.Num, status, ch.Title, ch.Outline))
-				}
-				return result.String(), nil
-			},
-		},
-		{
-			Name:        "read_foreshadows",
-			Description: "获取伏笔列表",
-			Parameters:  `{}`,
-			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
-				if len(ctx.State.Foreshadows) == 0 {
-					return agentMsg(ctx, "agent.no_foreshadows"), nil
-				}
-
-				var result strings.Builder
-				for _, fs := range ctx.State.Foreshadows {
-					result.WriteString(fmt.Sprintf("#%d [%s] %s\n", fs.ID, foreshadowStatusLabel(fs.Status), fs.Name))
-					result.WriteString(fmt.Sprintf("  描述: %s\n", fs.Description))
-					result.WriteString(fmt.Sprintf("  埋设: 第%d章", fs.PlantChapter))
-					if fs.TargetChapter > 0 {
-						result.WriteString(fmt.Sprintf(" → 预计回收: 第%d章", fs.TargetChapter))
-					}
-					result.WriteString("\n")
-					if len(fs.Events) > 0 {
-						result.WriteString("  进展:\n")
-						for _, ev := range fs.Events {
-							result.WriteString(fmt.Sprintf("    - 第%d章: %s\n", ev.Chapter, ev.Note))
-						}
-					}
-					if fs.Resolution != "" {
-						result.WriteString(fmt.Sprintf("  回收方式: %s\n", fs.Resolution))
-					}
-					result.WriteString("\n")
 				}
 				return result.String(), nil
 			},
@@ -1789,139 +1756,6 @@ func getBuiltinTools() []Tool {
 			},
 		},
 		{
-			Name:        "suggest_foreshadows",
-			Description: "AI 建议伏笔方案（异步）",
-			Parameters:  `{}`,
-			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
-				if len(ctx.State.Chapters) == 0 {
-					return "", agentErr(ctx, "need_generate_outline_first")
-				}
-				if ctx.StartAsync == nil {
-					return "", agentErr(ctx, "task_running_wait")
-				}
-				ctx.StartAsync("foreshadow_suggest", func(goCtx context.Context) error {
-					suggestions, err := SuggestForeshadows(goCtx, ctx.APICfg, ctx.Config, ctx.State, ctx.Logger)
-					if err != nil {
-						ctx.Logger.Error(fmt.Sprintf("伏笔建议生成失败: %v", err))
-						return err
-					}
-					ctx.Logger.Success(fmt.Sprintf("伏笔建议生成完成，共 %d 条", len(suggestions)))
-					ctx.Logger.ForeshadowSuggestions(suggestions)
-					return nil
-				})
-				return agentMsg(ctx, "agent.foreshadow_suggest_started"), nil
-			},
-		},
-		{
-			Name:        "create_foreshadow",
-			Description: "创建伏笔",
-			Parameters:  `{"name": "伏笔名", "description": "描述", "plant_chapter": 1, "target_chapter": 5}`,
-			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
-				var req struct {
-					Name          string `json:"name"`
-					Description   string `json:"description"`
-					PlantChapter  int    `json:"plant_chapter"`
-					TargetChapter int    `json:"target_chapter"`
-				}
-				if err := json.Unmarshal(args, &req); err != nil {
-					return "", agentErr(ctx, "invalid_json", err)
-				}
-				if req.Name == "" || req.Description == "" {
-					return "", agentErr(ctx, "worldview_field_empty")
-				}
-				fs := Foreshadow{
-					ID:            NextForeshadowID(ctx.State.Foreshadows),
-					Name:          req.Name,
-					Description:   req.Description,
-					PlantChapter:  req.PlantChapter,
-					TargetChapter: req.TargetChapter,
-					Status:        ForeshadowPlanted,
-					Events:        []ForeshadowEvent{},
-				}
-				ctx.State.Foreshadows = append(ctx.State.Foreshadows, fs)
-				if err := SaveProgress(ctx.ProgressPath, ctx.State); err != nil {
-					return "", agentErr(ctx, "save_failed", err)
-				}
-				_ = SaveForeshadowRoadmap(filepath.Dir(ctx.ProgressPath), ctx.State)
-				return agentMsg(ctx, "agent.foreshadow_created", fs.Name, fs.ID), nil
-			},
-		},
-		{
-			Name:        "update_foreshadow",
-			Description: "更新伏笔",
-			Parameters:  `{"id": 1, "name": "", "description": "", "plant_chapter": 0, "target_chapter": 0, "status": "", "resolution": ""}`,
-			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
-				var req struct {
-					ID            int    `json:"id"`
-					Name          string `json:"name"`
-					Description   string `json:"description"`
-					PlantChapter  int    `json:"plant_chapter"`
-					TargetChapter int    `json:"target_chapter"`
-					Status        string `json:"status"`
-					Resolution    string `json:"resolution"`
-				}
-				if err := json.Unmarshal(args, &req); err != nil {
-					return "", agentErr(ctx, "invalid_json", err)
-				}
-				idx := -1
-				for i, fs := range ctx.State.Foreshadows {
-					if fs.ID == req.ID {
-						idx = i
-						break
-					}
-				}
-				if idx == -1 {
-					return "", agentErr(ctx, "foreshadow_not_found")
-				}
-				fs := &ctx.State.Foreshadows[idx]
-				if req.Name != "" {
-					fs.Name = req.Name
-				}
-				if req.Description != "" {
-					fs.Description = req.Description
-				}
-				if req.PlantChapter > 0 {
-					fs.PlantChapter = req.PlantChapter
-				}
-				if req.TargetChapter > 0 {
-					fs.TargetChapter = req.TargetChapter
-				}
-				if req.Status != "" {
-					fs.Status = ForeshadowStatus(req.Status)
-				}
-				if req.Resolution != "" {
-					fs.Resolution = req.Resolution
-				}
-				if err := SaveProgress(ctx.ProgressPath, ctx.State); err != nil {
-					return "", agentErr(ctx, "save_failed", err)
-				}
-				_ = SaveForeshadowRoadmap(filepath.Dir(ctx.ProgressPath), ctx.State)
-				return agentMsg(ctx, "agent.foreshadow_updated", fs.Name), nil
-			},
-		},
-		{
-			Name:        "delete_foreshadow",
-			Description: "删除伏笔",
-			Parameters:  `{"id": 1}`,
-			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
-				var params struct {
-					ID int `json:"id"`
-				}
-				json.Unmarshal(args, &params)
-				for i, fs := range ctx.State.Foreshadows {
-					if fs.ID == params.ID {
-						ctx.State.Foreshadows = append(ctx.State.Foreshadows[:i], ctx.State.Foreshadows[i+1:]...)
-						if err := SaveProgress(ctx.ProgressPath, ctx.State); err != nil {
-							return "", agentErr(ctx, "save_failed", err)
-						}
-						_ = SaveForeshadowRoadmap(filepath.Dir(ctx.ProgressPath), ctx.State)
-						return agentMsg(ctx, "agent.foreshadow_deleted", fs.Name), nil
-					}
-				}
-				return agentMsg(ctx, "agent.foreshadow_not_found", params.ID), nil
-			},
-		},
-		{
 			Name:        "read_skills",
 			Description: "获取所有技能及启用状态",
 			Parameters:  `{}`,
@@ -1982,19 +1816,152 @@ func getBuiltinTools() []Tool {
 		},
 		{
 			Name:        "reset_progress",
-			Description: "【危险·不可逆】重置所有进度，清除全部章节、大纲和伏笔。仅当用户明确要求重置/清空整个项目进度时使用，且必须先向用户确认。",
+			Description: "【危险·不可逆】重置所有进度，清除全部章节和大纲。仅当用户明确要求重置/清空整个项目进度时使用，且必须先向用户确认。",
 			Parameters:  `{"confirm": true}`,
 			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
-				if msg := requireConfirm(ctx, args, fmt.Sprintf("重置全部进度（共 %d 章及所有伏笔）", len(ctx.State.Chapters))); msg != "" {
+				if msg := requireConfirm(ctx, args, fmt.Sprintf("重置全部进度（共 %d 章）", len(ctx.State.Chapters))); msg != "" {
 					return msg, nil
 				}
 				if err := deleteFile(ctx.ProgressPath); err != nil {
 					return "", agentErr(ctx, "delete_progress_failed", err)
 				}
-				// 原地清空，保证 Handlers 持有的同一指针也被重置
 				*ctx.State = Progress{Phase: "outline"}
 				ctx.Logger.Success("进度已重置。")
 				return agentMsg(ctx, "agent.progress_reset"), nil
+			},
+		},
+		{
+			Name:        "prepare_image",
+			Description: "为生图准备 prompt（异步）。anima=true 走 comfyui-animatool 多步 Agent 工作流（情境因果→视觉简报→tag校验→三层prompt→冲突检查），anima=false 走简单单次 LLM 增强。",
+			Parameters:  `{"intent": "用户意图描述", "anima": true, "resolution": "", "count": 1, "chapter_num": 0}`,
+			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
+				var params ImagePrepareRequest
+				if err := json.Unmarshal(args, &params); err != nil || params.Intent == "" {
+					return "", agentErr(ctx, "missing_content")
+				}
+				if ctx.StartAsync == nil {
+					return "", agentErr(ctx, "task_running_wait")
+				}
+				settings, _ := loadMediaSettings(ctx.ProjectDir)
+				resolution := params.Resolution
+				if resolution == "" {
+					resolution = settings.Image.DefaultResolution
+				}
+				batchCount := params.Count
+				if batchCount <= 0 {
+					batchCount = 1
+				}
+				apiCfg := ctx.APICfg
+				projDir := ctx.ProjectDir
+				projSettings := ctx.Settings
+				intent := params.Intent
+				anima := params.Anima
+				logger := ctx.Logger
+
+				ctx.StartAsync("image_prepare", func(goCtx context.Context) error {
+					if anima {
+						batch, err := runImagePrepareAgent(goCtx, apiCfg, projDir, projSettings, intent, resolution, batchCount, logger)
+						if err != nil {
+							return err
+						}
+						if logger != nil {
+							if batchCount == 1 && len(batch.Results) == 1 {
+								logger.Emit("image_prepare_done", &batch.Results[0])
+							} else {
+								logger.Emit("image_prepare_done", batch)
+							}
+						}
+						return nil
+					}
+					// Legacy: single LLM call
+					charCtx := buildCharacterContextForLang(projSettings, "", "zh")
+					worldCtx := buildWorldviewContextForLang(projSettings, "", "zh")
+					systemPrompt := "你是一位专业的AI绘画提示词撰写师。根据用户的自然语言描述和项目设定，生成一个详细、结构化的绘画提示词。输出纯JSON: {\"prompt\": \"...\", \"negative_prompt\": \"...\", \"tags\": [...]}。tags含type和name字段，type为character/scene/style之一。"
+					userPrompt := fmt.Sprintf("项目角色设定:\n%s\n\n世界观设定:\n%s\n\n用户意图: %s", charCtx, worldCtx, intent)
+					rawResp := CallAPIWithRetryLog(goCtx, apiCfg, systemPrompt, userPrompt, logger)
+					if rawResp == "" {
+						return fmt.Errorf("图片提示词生成失败")
+					}
+					rawResp = cleanJSONResponse(rawResp)
+					var parsed struct {
+						Prompt         string     `json:"prompt"`
+						NegativePrompt string     `json:"negative_prompt"`
+						Tags           []ImageTag `json:"tags"`
+					}
+					json.Unmarshal([]byte(rawResp), &parsed)
+					if parsed.Prompt == "" {
+						parsed.Prompt = intent
+						parsed.NegativePrompt = "blurry, low quality, deformed"
+					}
+					r := &ImagePrepareResult{
+						Prompt: parsed.Prompt, NegativePrompt: parsed.NegativePrompt,
+						Resolution: resolution, Backend: apiCfg.ImageBackend, Tags: parsed.Tags,
+					}
+					if logger != nil {
+						logger.Emit("image_prepare_done", r)
+					}
+					return nil
+				})
+				return agentMsg(ctx, "agent.image_prepare_started"), nil
+			},
+		},
+		{
+			Name:        "generate_image",
+			Description: "调用生图 API 生成图片（异步）。需要先通过 prepare_image 准备好 prompt。count 在每项内独立设置，默认 1。",
+			Parameters:  `{"prompts": [{"prompt": "正向prompt", "negative_prompt": "", "resolution": "1024x1024", "tags": [], "count": 1}]}`,
+			Execute: func(args json.RawMessage, ctx *AgentContext) (string, error) {
+				var params struct {
+					Prompts []struct {
+						Prompt         string     `json:"prompt"`
+						NegativePrompt string     `json:"negative_prompt,omitempty"`
+						Resolution     string     `json:"resolution"`
+						Tags           []ImageTag `json:"tags,omitempty"`
+						ChapterNum     int        `json:"chapter_num,omitempty"`
+						Count          int        `json:"count"`
+					} `json:"prompts"`
+				}
+				if err := json.Unmarshal(args, &params); err != nil || len(params.Prompts) == 0 {
+					return "", agentErr(ctx, "missing_content")
+				}
+				if ctx.StartAsync == nil {
+					return "", agentErr(ctx, "task_running_wait")
+				}
+				apiCfg := ctx.APICfg
+				projDir := ctx.ProjectDir
+				logger := ctx.Logger
+				allPrompts := params.Prompts
+
+				ctx.StartAsync("image_generation", func(goCtx context.Context) error {
+					for _, p := range allPrompts {
+						resolution := p.Resolution
+						if resolution == "" {
+							resolution = "1024x1024"
+						}
+						c := p.Count
+						if c <= 0 {
+							c = 1
+						}
+						for i := 0; i < c; i++ {
+							if goCtx.Err() != nil {
+								return goCtx.Err()
+							}
+							_, err := generateImage(apiCfg, projDir, p.Prompt, p.NegativePrompt, resolution, p.Tags, p.ChapterNum, logger)
+							if err != nil {
+								logger.Error(fmt.Sprintf("生图失败: %v", err))
+							}
+						}
+					}
+					return nil
+				})
+				total := 0
+				for _, p := range allPrompts {
+					c := p.Count
+					if c <= 0 {
+						c = 1
+					}
+					total += c
+				}
+				return fmt.Sprintf("已启动生图任务，共 %d 个 prompt × 共 %d 张", len(allPrompts), total), nil
 			},
 		},
 	}

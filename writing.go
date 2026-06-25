@@ -151,10 +151,6 @@ func GenerateChapterAction(ctx context.Context, apiCfg *APIConfig, cfg *Config, 
 		}
 	}
 
-	if len(state.Foreshadows) > 0 {
-		RunForeshadowOutlineCheckAndSave(ctx, apiCfg, cfg, state, progressPath, logger)
-	}
-
 	maxFactCheckRetries := 3
 	extraConstraints := ""
 	var accumulatedIssues []string
@@ -244,11 +240,6 @@ func GenerateChapterAction(ctx context.Context, apiCfg *APIConfig, cfg *Config, 
 
 	state.PendingWritingConflict = nil
 
-	if len(state.Foreshadows) > 0 {
-		logger.StepInfo(5, 6, "正在更新伏笔状态...")
-		syncForeshadowsAfterChapter(ctx, apiCfg, cfg, state, i, progressPath, logger)
-	}
-
 	logger.StepInfo(6, 6, "正在维护叙事记忆...")
 	syncMemoryAfterChapter(ctx, apiCfg, cfg, state, i, progressPath, logger)
 
@@ -309,7 +300,7 @@ func checkOutlineConsistency(ctx context.Context, apiCfg *APIConfig, cfg *Config
 		"HistorySummary": buildHistorySummaryForLang(state, idx, lang),
 		"PreviousEnding": prevEnding,
 	})
-	systemPrompt := SystemPromptFor(lang, "outline_editor_brief_json")
+	systemPrompt := SystemPromptFor("", "outline_editor_brief_json")
 
 	rawResp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)
 	if rawResp == "" {
@@ -392,13 +383,6 @@ func ReviseChapterAction(ctx context.Context, apiCfg *APIConfig, cfg *Config, st
 		return err
 	}
 
-	if len(state.Foreshadows) > 0 {
-		syncForeshadowsAfterChapter(ctx, apiCfg, cfg, state, chapterIdx, progressPath, logger)
-		if err := SaveProgress(progressPath, state); err != nil {
-			return err
-		}
-	}
-
 	syncMemoryAfterChapter(ctx, apiCfg, cfg, state, chapterIdx, progressPath, logger)
 
 	logger.SuccessKey("log.chapter_revised")
@@ -455,13 +439,6 @@ func ReviseSpecificChapterAction(ctx context.Context, apiCfg *APIConfig, cfg *Co
 
 	if err := SaveProgress(progressPath, state); err != nil {
 		return err
-	}
-
-	if len(state.Foreshadows) > 0 {
-		syncForeshadowsAfterChapter(ctx, apiCfg, cfg, state, chapterIdx, progressPath, logger)
-		if err := SaveProgress(progressPath, state); err != nil {
-			return err
-		}
 	}
 
 	syncMemoryAfterChapter(ctx, apiCfg, cfg, state, chapterIdx, progressPath, logger)
@@ -542,7 +519,7 @@ func generateChapterContentStream(ctx context.Context, apiCfg *APIConfig, cfg *C
 
 	systemPrompt := state.CorePrompt
 	if systemPrompt == "" {
-		systemPrompt = SystemPromptFor(lang, "author_default")
+		systemPrompt = SystemPromptFor("", "author_default")
 	}
 
 	onChunk := func(chunk string) {
@@ -589,7 +566,7 @@ func generateChapterSummary(ctx context.Context, apiCfg *APIConfig, cfg *Config,
 		"ChapterContent": content,
 	})
 
-	systemPrompt := SystemPromptFor(cfg.Language, "summary_analyst")
+	systemPrompt := SystemPromptFor("", "summary_analyst")
 	return CallAPI(ctx, apiCfg, systemPrompt, userPrompt)
 }
 
@@ -656,7 +633,7 @@ func generateChapterFactCheck(ctx context.Context, apiCfg *APIConfig, cfg *Confi
 		}
 	}
 
-	systemPrompt := SystemPromptFor(lang, "fact_checker_json")
+	systemPrompt := SystemPromptFor("", "fact_checker_json")
 	return CallAPI(ctx, apiCfg, systemPrompt, userPrompt)
 }
 
@@ -711,9 +688,9 @@ func reviseChapterContentStream(ctx context.Context, apiCfg *APIConfig, cfg *Con
 
 	systemPrompt := state.CorePrompt
 	if systemPrompt == "" {
-		systemPrompt = SystemPromptFor(lang, "author_default")
+		systemPrompt = SystemPromptFor("", "author_default")
 	}
-	systemPrompt += SystemPromptFor(lang, "chapter_revision_suffix")
+	systemPrompt += SystemPromptFor("", "chapter_revision_suffix")
 
 	onChunk := func(chunk string) {
 		logger.ContentChunk(chapterIdx, chunk)
@@ -765,7 +742,7 @@ func reviseSubsequentOutlines(ctx context.Context, apiCfg *APIConfig, cfg *Confi
 		"LockedChapters": lockedChapters,
 	})
 
-	systemPrompt := SystemPromptFor(lang, "outline_editor_locked_json")
+	systemPrompt := SystemPromptFor("", "outline_editor_locked_json")
 
 	rawResp := CallAPIWithRetry(ctx, apiCfg, systemPrompt, userPrompt)
 	if rawResp == "" {
@@ -891,7 +868,7 @@ func SmoothTransitionsAction(ctx context.Context, apiCfg *APIConfig, cfg *Config
 			"PrevTail":       prevTail,
 			"Opening":        opening,
 		})
-		systemPrompt := SystemPromptFor(cfg.Language, "transition_editor")
+		systemPrompt := SystemPromptFor("", "transition_editor")
 
 		resp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)
 		if resp == "" {
@@ -963,7 +940,7 @@ func PolishChapterAction(ctx context.Context, apiCfg *APIConfig, cfg *Config, st
 %s`, skillsContent, ch.Content)
 	}
 
-	systemPrompt := SystemPromptFor(cfg.Language, "polish_editor")
+	systemPrompt := SystemPromptFor("", "polish_editor")
 
 	onChunk := func(chunk string) {
 		logger.ContentChunk(chapterIdx, chunk)
@@ -1050,7 +1027,7 @@ func syncMemoryAfterChapter(ctx context.Context, apiCfg *APIConfig, cfg *Config,
 		"MemoryMaxTokens": fmt.Sprintf("%d", state.MemoryMaxTokens),
 	})
 
-	systemPrompt := SystemPromptFor(lang, "memory_manager")
+	systemPrompt := SystemPromptFor("", "memory_manager")
 	if systemPrompt == "" {
 		systemPrompt = "你是一位精准的小说叙事记忆管理员。"
 	}
@@ -1114,4 +1091,7 @@ func parseMemoryUpdateResult(result string) ([]memoryNewEntry, []memoryUpdateEnt
 		return nil, nil, err
 	}
 	return parsed.NewMemories, parsed.Updates, nil
+}
+
+func syncForeshadowsAfterChapter(ctx context.Context, apiCfg *APIConfig, cfg *Config, state *Progress, chapterIdx int, progressPath string, logger *LogBroadcaster) {
 }

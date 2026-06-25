@@ -13,6 +13,11 @@ type APIConfig struct {
 	MaxTokens            int    `json:"max_tokens,omitempty"`           // 0 = 模型默认；Agent 调用建议 ≥ 8192
 	HTTPTimeoutSeconds   int    `json:"http_timeout_seconds"`
 	ContextBudgetTokens  int    `json:"context_budget_tokens"` // 全书优化上下文预算，默认 900000
+	MediaBaseURL         string `json:"media_base_url"`        // TTS/生图 API 地址，默认 "https://api.302.ai"
+	MediaAPIKey          string `json:"media_api_key"`         // TTS/生图 API Key
+	ImageBackend         string `json:"image_backend"`         // "openai" | "comfyui"
+	ComfyUIBaseURL       string `json:"comfyui_base_url"`      // ComfyUI 地址
+	DanbooruTagsPath     string `json:"danbooru_tags_path"`    // danbooru-tags.exe 路径
 }
 
 type Config struct {
@@ -27,14 +32,9 @@ const (
 	LangEN = "en"
 )
 
-// NormalizeLanguage returns "zh" / "en"; unknown values fall back to "zh".
+// NormalizeLanguage always returns "zh" (i18n removed).
 func NormalizeLanguage(lang string) string {
-	switch lang {
-	case LangEN, "en-US", "en-GB":
-		return LangEN
-	default:
-		return LangZH
-	}
+	return LangZH
 }
 
 type StoryConfig struct {
@@ -260,8 +260,5 @@ func (p *PromptsConfig) applyDefaults(lang string) {
 }
 
 func DefaultPromptsForLang(lang string) PromptsConfig {
-	if NormalizeLanguage(lang) == LangEN {
-		return DefaultPromptsEN
-	}
 	return DefaultPromptsZH
 }

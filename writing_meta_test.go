@@ -16,12 +16,6 @@ func TestStripChapterMetaProse(t *testing.T) {
 			want: "她推开门。",
 		},
 		{
-			name: "en basic",
-			in:   "Chapter 1: Arrival\n\nShe opened the door.\n\nEnd of chapter",
-			lang: LangEN,
-			want: "She opened the door.",
-		},
-		{
 			name: "zh preamble revised",
 			in:   "以下为修订后的第3章完整正文：\n\n她走进了房间。\n\n本章完",
 			lang: LangZH,
@@ -38,12 +32,6 @@ func TestStripChapterMetaProse(t *testing.T) {
 			in:   "（第5章正文）\n\n夜色深沉。\n\n（完）",
 			lang: LangZH,
 			want: "夜色深沉。",
-		},
-		{
-			name: "en preamble here is",
-			in:   "Here is the revised Chapter 3:\n\nThe door opened.\n\nEnd of chapter",
-			lang: LangEN,
-			want: "The door opened.",
 		},
 	}
 

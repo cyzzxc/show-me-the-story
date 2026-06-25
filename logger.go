@@ -85,7 +85,6 @@ func (lb *LogBroadcaster) logKey(level, key string, args ...any) {
 		MsgKey:  key,
 		MsgArgs: msgArgsToStrings(args...),
 		Msg:     T(LangZH, key, args...),
-		MsgEN:   T(LangEN, key, args...),
 		Time:    time.Now().Format("15:04:05"),
 	})
 }
@@ -108,12 +107,6 @@ func (lb *LogBroadcaster) InfoKey(key string, args ...any)    { lb.logKey("info"
 func (lb *LogBroadcaster) ErrorKey(key string, args ...any)   { lb.logKey("error", key, args...) }
 func (lb *LogBroadcaster) WarnKey(key string, args ...any)    { lb.logKey("warn", key, args...) }
 func (lb *LogBroadcaster) SuccessKey(key string, args ...any) { lb.logKey("success", key, args...) }
-
-// *Bilingual variants supply both zh and en text; frontend picks based on UI locale.
-func (lb *LogBroadcaster) InfoBilingual(zh, en string)    { lb.logBilingual("info", zh, en) }
-func (lb *LogBroadcaster) ErrorBilingual(zh, en string)   { lb.logBilingual("error", zh, en) }
-func (lb *LogBroadcaster) WarnBilingual(zh, en string)    { lb.logBilingual("warn", zh, en) }
-func (lb *LogBroadcaster) SuccessBilingual(zh, en string) { lb.logBilingual("success", zh, en) }
 
 func (lb *LogBroadcaster) StepInfo(step, total int, msg string) {
 	lb.Log("info", fmt.Sprintf("[%d/%d] %s", step, total, msg))
@@ -149,14 +142,6 @@ func (lb *LogBroadcaster) TaskEnd(task string, success bool) {
 
 func (lb *LogBroadcaster) ContentChunk(chapterIdx int, text string) {
 	lb.Emit("content_chunk", map[string]interface{}{"chapter_idx": chapterIdx, "text": text})
-}
-
-func (lb *LogBroadcaster) ForeshadowSuggestions(suggestions []ForeshadowSuggestion) {
-	lb.Emit("foreshadow_suggestions", suggestions)
-}
-
-func (lb *LogBroadcaster) ForeshadowOutlineConflicts(report *ForeshadowOutlineReport) {
-	lb.Emit("foreshadow_outline_conflicts", report)
 }
 
 func (lb *LogBroadcaster) OutlineCharacterSuggestions(suggestions []OutlineCharacterSuggestion) {

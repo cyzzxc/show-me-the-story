@@ -51,7 +51,7 @@ func analyzeWritingConflict(ctx context.Context, apiCfg *APIConfig, cfg *Config,
 	userPrompt = appendIfMissingPlaceholder(cfg.Prompts.WritingConflictAnalysis, userPrompt, "{{.OutlineConstraints}}", outlineConstraints)
 	userPrompt = appendIfMissingPlaceholder(cfg.Prompts.WritingConflictAnalysis, userPrompt, "{{.Foreshadows}}", foreshadowBlock)
 
-	systemPrompt := SystemPromptFor(lang, "writing_conflict_analyst_json")
+	systemPrompt := SystemPromptFor("", "writing_conflict_analyst_json")
 	rawResp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)
 	if rawResp == "" {
 		return nil, fmt.Errorf("API 调用失败或被取消")

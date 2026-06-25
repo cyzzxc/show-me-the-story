@@ -31,7 +31,7 @@ func AnalyzeExistingContent(ctx context.Context, apiCfg *APIConfig, cfg *Config,
 		"ExistingContent": content,
 	})
 
-	systemPrompt := SystemPromptFor(cfg.Language, "content_analyst_json")
+	systemPrompt := SystemPromptFor("", "content_analyst_json")
 
 	rawResp := CallAPIWithRetry(ctx, apiCfg, systemPrompt, userPrompt)
 	if rawResp == "" {

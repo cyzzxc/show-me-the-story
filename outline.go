@@ -41,7 +41,7 @@ func generateOutline(ctx context.Context, apiCfg *APIConfig, cfg *Config, settin
 		"StorySynopsis": cfg.Story.StorySynopsis,
 	}, cfg, settings)
 
-	systemPrompt := SystemPromptFor(cfg.Language, "outline_editor_json")
+	systemPrompt := SystemPromptFor("", "outline_editor_json")
 	minLen, _ := calcOutlineLengthRange(cfg.Story.TargetWordsPerChapter)
 
 	var lastResp *OutlineResponse
@@ -93,7 +93,7 @@ func intSliceToStr(nums []int) []string {
 
 func generateOutlineChaptersOnly(ctx context.Context, apiCfg *APIConfig, cfg *Config, settings *ProjectSettings, template string, baseData map[string]string, logger *LogBroadcaster) ([]OutlineChapter, error) {
 	data := mergeOutlinePromptData(baseData, cfg, settings)
-	systemPrompt := SystemPromptFor(cfg.Language, "outline_editor_json")
+	systemPrompt := SystemPromptFor("", "outline_editor_json")
 	minLen, _ := calcOutlineLengthRange(cfg.Story.TargetWordsPerChapter)
 
 	var lastChapters []OutlineChapter
@@ -159,7 +159,7 @@ func reviseOutline(ctx context.Context, apiCfg *APIConfig, cfg *Config, state *P
 		"LockedChapters": lockedChapters,
 	}, cfg, settings)
 
-	systemPrompt := SystemPromptFor(lang, "outline_editor_locked_json")
+	systemPrompt := SystemPromptFor("", "outline_editor_locked_json")
 	minLen, _ := calcOutlineLengthRange(cfg.Story.TargetWordsPerChapter)
 
 	var resp OutlineResponse
@@ -229,6 +229,17 @@ func cleanJSONResponse(s string) string {
 	}
 	if strings.HasSuffix(s, "```") {
 		s = strings.TrimSuffix(s, "```")
+	}
+	s = strings.TrimSpace(s)
+	// If the string doesn't start with '{', try to find the JSON object
+	if !strings.HasPrefix(s, "{") {
+		start := strings.Index(s, "{")
+		if start >= 0 {
+			end := strings.LastIndex(s, "}")
+			if end > start {
+				s = s[start : end+1]
+			}
+		}
 	}
 	return strings.TrimSpace(s)
 }

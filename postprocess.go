@@ -407,7 +407,7 @@ func DiagnoseBookAction(ctx context.Context, apiCfg *APIConfig, cfg *Config, set
 		"FullText":     fullTextBlock,
 		"ModeNote":     modeNote,
 	})
-	systemPrompt := SystemPromptFor(cfg.Language, "book_diagnosis")
+	systemPrompt := SystemPromptFor("", "book_diagnosis")
 
 	resp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)
 	if resp == "" {
@@ -460,7 +460,7 @@ func runConsistencyCheckVolume(ctx context.Context, apiCfg *APIConfig, cfg *Conf
 		"FullText":     volumeText,
 		"VolumeNote":   volNote,
 	})
-	systemPrompt := SystemPromptFor(cfg.Language, "book_consistency_check")
+	systemPrompt := SystemPromptFor("", "book_consistency_check")
 
 	resp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)
 	if resp == "" {
@@ -482,7 +482,7 @@ func BuildRoadmapAction(ctx context.Context, apiCfg *APIConfig, cfg *Config, dia
 		"DiagnosisReport":   diagnosisReport,
 		"ConsistencyReport": consistencyReport,
 	})
-	systemPrompt := SystemPromptFor(cfg.Language, "book_roadmap")
+	systemPrompt := SystemPromptFor("", "book_roadmap")
 
 	resp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)
 	if resp == "" {

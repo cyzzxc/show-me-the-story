@@ -35,6 +35,7 @@ type Handlers struct {
 	sessionsDir  string
 	postprocess     *PostProcessState
 	postprocessPath string
+	lastPrepareResult *ImagePrepareResult
 
 	// Task management
 	taskMu      sync.Mutex
@@ -44,6 +45,12 @@ type Handlers struct {
 	taskCancel  context.CancelFunc
 	taskTokens  *TaskTokenUsage
 	autoConfirm bool // 自动确认模式：章节生成完成后自动确认并继续生成下一章
+
+	// Generate/image task management (separate from LLM tasks)
+	generateMu      sync.Mutex
+	generateRunning bool
+	generateCtx     context.Context
+	generateCancel  context.CancelFunc
 
 	pendingContinueContent string
 	lastChatMessage        string      // 缓存最后发送的聊天消息，用于重试
@@ -201,8 +208,37 @@ func (h *Handlers) startChildWork() bool {
 
 func (h *Handlers) isTaskRunning() bool {
 	h.taskMu.Lock()
-	defer h.taskMu.Unlock()
-	return h.taskRunning || h.activeWork > 0
+	lt := h.taskRunning || h.activeWork > 0
+	h.taskMu.Unlock()
+
+	h.generateMu.Lock()
+	gt := h.generateRunning
+	h.generateMu.Unlock()
+
+	return lt || gt
+}
+
+func (h *Handlers) tryStartGenerateTask() bool {
+	h.generateMu.Lock()
+	defer h.generateMu.Unlock()
+	if h.generateRunning {
+		return false
+	}
+	h.generateRunning = true
+	ctx, cancel := context.WithCancel(context.Background())
+	h.generateCtx = ctx
+	h.generateCancel = cancel
+	return true
+}
+
+func (h *Handlers) endGenerateTask() {
+	h.generateMu.Lock()
+	h.generateRunning = false
+	if h.generateCancel != nil {
+		h.generateCancel()
+		h.generateCancel = nil
+	}
+	h.generateMu.Unlock()
 }
 
 // rejectIfTaskRunning 在 AI 任务运行期间拒绝编辑类请求，防止意外提交修改。
@@ -808,29 +844,6 @@ func (h *Handlers) PostChapterConflictResolve(w http.ResponseWriter, r *http.Req
 	}
 }
 
-func (h *Handlers) PostForeshadowOutlineCheck(w http.ResponseWriter, r *http.Request) {
-	if !h.tryStartTask() {
-		h.writeErrorReq(w, r, http.StatusConflict, "task_running_wait")
-		return
-	}
-	if len(h.state.Foreshadows) == 0 {
-		h.endTask()
-		h.writeErrorReq(w, r, http.StatusBadRequest, "no_foreshadows_to_check")
-		return
-	}
-
-	go func() {
-		defer h.endTask()
-		h.logger.TaskStart("foreshadow_outline_check")
-		ctx := h.taskCtx
-		RunForeshadowOutlineCheckAndSave(ctx, h.apiCfg, h.cfg, h.state, h.progressPath, h.logger)
-		h.logger.TaskEnd("foreshadow_outline_check", true)
-		h.broadcastProgress()
-	}()
-
-	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
-}
-
 func (h *Handlers) PostChapterConfirm(w http.ResponseWriter, r *http.Request) {
 	if h.isTaskRunning() {
 		h.writeErrorReq(w, r, http.StatusConflict, "task_running_wait")
@@ -1130,8 +1143,6 @@ func (h *Handlers) PutChapterOutline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go RunForeshadowOutlineCheckAndSave(context.Background(), h.apiCfg, h.cfg, h.state, h.progressPath, h.logger)
-
 	h.logger.SuccessKey("log.chapter_outline_updated", num)
 	h.writeJSON(w, http.StatusOK, h.state)
 }
@@ -1279,246 +1290,6 @@ func (h *Handlers) GetStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.writeJSON(w, http.StatusOK, resp)
-}
-
-func (h *Handlers) GetForeshadows(w http.ResponseWriter, r *http.Request) {
-	if h.state.Foreshadows == nil {
-		h.writeJSON(w, http.StatusOK, []Foreshadow{})
-		return
-	}
-	h.writeJSON(w, http.StatusOK, h.state.Foreshadows)
-}
-
-func (h *Handlers) GetForeshadowsRoadmap(w http.ResponseWriter, r *http.Request) {
-	if !h.ensureProject(w, r) {
-		return
-	}
-	markdown := BuildForeshadowRoadmapMarkdown(h.state)
-	h.writeJSON(w, http.StatusOK, map[string]string{
-		"markdown": markdown,
-		"path":     ForeshadowRoadmapPath(h.projectDir()),
-	})
-}
-
-func (h *Handlers) persistForeshadowRoadmap() {
-	if err := SaveForeshadowRoadmap(h.projectDir(), h.state); err != nil {
-		h.logger.WarnKey("log.foreshadow_roadmap_save_failed", err)
-	}
-}
-
-func (h *Handlers) PostForeshadowsSuggest(w http.ResponseWriter, r *http.Request) {
-	if !h.tryStartTask() {
-		h.writeErrorReq(w, r, http.StatusConflict, "task_running_wait")
-		return
-	}
-
-	if len(h.state.Chapters) == 0 {
-		h.endTask()
-		h.writeErrorReq(w, r, http.StatusBadRequest, "need_generate_outline_first")
-		return
-	}
-
-	go func() {
-		defer h.endTask()
-		h.logger.TaskStart("foreshadow_suggest")
-		ctx := h.taskCtx
-
-		h.logger.InfoKey("log.foreshadow_suggesting")
-		suggestions, err := SuggestForeshadows(ctx, h.apiCfg, h.cfg, h.state, h.logger)
-
-		if err != nil {
-			if ctx.Err() != nil {
-				h.logger.WarnKey("log.foreshadow_suggest_cancelled")
-				h.logger.TaskEnd("foreshadow_suggest", false)
-			} else {
-				h.logger.ErrorKey("log.foreshadow_suggest_failed", err)
-				h.logger.TaskEnd("foreshadow_suggest", false)
-			}
-			return
-		}
-
-		h.logger.SuccessKey("log.foreshadow_suggest_done", len(suggestions))
-		h.logger.TaskEnd("foreshadow_suggest", true)
-		h.logger.ForeshadowSuggestions(suggestions)
-	}()
-
-	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
-}
-
-func (h *Handlers) PostForeshadow(w http.ResponseWriter, r *http.Request) {
-	if h.rejectIfTaskRunning(w, r) {
-		return
-	}
-	var req struct {
-		Name          string `json:"name"`
-		Description   string `json:"description"`
-		PlantChapter  int    `json:"plant_chapter"`
-		TargetChapter int    `json:"target_chapter"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-	if req.Name == "" {
-		h.writeErrorReq(w, r, http.StatusBadRequest, "foreshadow_name_required")
-		return
-	}
-	if req.Description == "" {
-		h.writeErrorReq(w, r, http.StatusBadRequest, "foreshadow_desc_required")
-		return
-	}
-
-	fs := Foreshadow{
-		ID:            NextForeshadowID(h.state.Foreshadows),
-		Name:          req.Name,
-		Description:   req.Description,
-		PlantChapter:  req.PlantChapter,
-		TargetChapter: req.TargetChapter,
-		Status:        ForeshadowPlanted,
-		Events:        []ForeshadowEvent{},
-	}
-
-	h.state.Foreshadows = append(h.state.Foreshadows, fs)
-
-	if err := SaveProgress(h.progressPath, h.state); err != nil {
-		h.writeErrorReq(w, r, http.StatusInternalServerError, "save_failed", err.Error())
-		return
-	}
-
-	h.persistForeshadowRoadmap()
-	h.writeJSON(w, http.StatusOK, fs)
-}
-
-func (h *Handlers) PutForeshadow(w http.ResponseWriter, r *http.Request) {
-	if h.rejectIfTaskRunning(w, r) {
-		return
-	}
-	idStr := r.PathValue("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_foreshadow_id")
-		return
-	}
-
-	var req struct {
-		Name          string           `json:"name"`
-		Description   string           `json:"description"`
-		PlantChapter  int              `json:"plant_chapter"`
-		TargetChapter int              `json:"target_chapter"`
-		Status        ForeshadowStatus `json:"status"`
-		Resolution    string           `json:"resolution"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-
-	idx := -1
-	for i, fs := range h.state.Foreshadows {
-		if fs.ID == id {
-			idx = i
-			break
-		}
-	}
-	if idx == -1 {
-		h.writeErrorReq(w, r, http.StatusNotFound, "foreshadow_not_found")
-		return
-	}
-
-	fs := &h.state.Foreshadows[idx]
-	if req.Name != "" {
-		fs.Name = req.Name
-	}
-	if req.Description != "" {
-		fs.Description = req.Description
-	}
-	if req.PlantChapter > 0 {
-		fs.PlantChapter = req.PlantChapter
-	}
-	if req.TargetChapter > 0 {
-		fs.TargetChapter = req.TargetChapter
-	}
-	if req.Status != "" {
-		fs.Status = req.Status
-	}
-	if req.Resolution != "" {
-		fs.Resolution = req.Resolution
-	}
-
-	if err := SaveProgress(h.progressPath, h.state); err != nil {
-		h.writeErrorReq(w, r, http.StatusInternalServerError, "save_failed", err.Error())
-		return
-	}
-
-	h.persistForeshadowRoadmap()
-	h.writeJSON(w, http.StatusOK, fs)
-}
-
-func (h *Handlers) DeleteForeshadow(w http.ResponseWriter, r *http.Request) {
-	if h.rejectIfTaskRunning(w, r) {
-		return
-	}
-	idStr := r.PathValue("id")
-	var id int
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_foreshadow_id")
-		return
-	}
-
-	idx := -1
-	for i, fs := range h.state.Foreshadows {
-		if fs.ID == id {
-			idx = i
-			break
-		}
-	}
-	if idx == -1 {
-		h.writeErrorReq(w, r, http.StatusNotFound, "foreshadow_not_found")
-		return
-	}
-
-	h.state.Foreshadows = append(h.state.Foreshadows[:idx], h.state.Foreshadows[idx+1:]...)
-
-	if err := SaveProgress(h.progressPath, h.state); err != nil {
-		h.writeErrorReq(w, r, http.StatusInternalServerError, "save_failed", err.Error())
-		return
-	}
-
-	h.persistForeshadowRoadmap()
-	h.writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
-
-func (h *Handlers) PostForeshadowsConfirm(w http.ResponseWriter, r *http.Request) {
-	if h.rejectIfTaskRunning(w, r) {
-		return
-	}
-	var req struct {
-		Foreshadows []Foreshadow `json:"foreshadows"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-
-	for i := range req.Foreshadows {
-		req.Foreshadows[i].ID = NextForeshadowID(h.state.Foreshadows) + i
-		req.Foreshadows[i].Status = ForeshadowPlanted
-		if req.Foreshadows[i].Events == nil {
-			req.Foreshadows[i].Events = []ForeshadowEvent{}
-		}
-	}
-
-	h.state.Foreshadows = append(h.state.Foreshadows, req.Foreshadows...)
-
-	if err := SaveProgress(h.progressPath, h.state); err != nil {
-		h.writeErrorReq(w, r, http.StatusInternalServerError, "save_failed", err.Error())
-		return
-	}
-
-	h.persistForeshadowRoadmap()
-	h.broadcastProgress()
-	go RunForeshadowOutlineCheckAndSave(context.Background(), h.apiCfg, h.cfg, h.state, h.progressPath, h.logger)
-	h.writeJSON(w, http.StatusOK, h.state.Foreshadows)
 }
 
 func (h *Handlers) PostContinueImport(w http.ResponseWriter, r *http.Request) {
@@ -2673,6 +2444,393 @@ func (h *Handlers) PostChatMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 // saveAgentSteps 将 Agent 步骤追加为会话消息。
+func (h *Handlers) GetMediaSettings(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	ms, err := loadMediaSettings(h.projectDir())
+	if err != nil {
+		h.writeErrorReq(w, r, http.StatusInternalServerError, "invalid_json", err.Error())
+		return
+	}
+	h.writeJSON(w, http.StatusOK, ms)
+}
+
+func (h *Handlers) PutMediaSettings(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	if h.rejectIfTaskRunning(w, r) {
+		return
+	}
+	var ms MediaSettings
+	if err := json.NewDecoder(r.Body).Decode(&ms); err != nil {
+		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if err := saveMediaSettings(h.projectDir(), &ms); err != nil {
+		h.writeErrorReq(w, r, http.StatusInternalServerError, "save_failed", err.Error())
+		return
+	}
+	h.writeJSON(w, http.StatusOK, &ms)
+}
+
+func (h *Handlers) PostMediaTTS(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	var req struct {
+		ChapterNum int `json:"chapter_num"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChapterNum <= 0 {
+		h.writeErrorReq(w, r, http.StatusBadRequest, "chapter_num_required")
+		return
+	}
+	if !h.tryStartGenerateTask() {
+		h.writeErrorReq(w, r, http.StatusConflict, "task_running_wait")
+		return
+	}
+
+	projectDir := h.projectDir()
+	chapterIdx := h.findChapterIdxByNum(req.ChapterNum)
+	if chapterIdx < 0 {
+		h.endGenerateTask()
+		h.writeErrorReq(w, r, http.StatusNotFound, "chapter_not_found")
+		return
+	}
+
+	go func() {
+		defer h.endGenerateTask()
+		h.logger.TaskStart("tts_generate")
+		ctx := h.generateCtx
+
+		err := generateTTS(ctx, h.apiCfg, projectDir, req.ChapterNum, h.logger)
+		if err != nil {
+			if ctx.Err() != nil {
+				h.logger.Warn("TTS 生成已取消")
+			} else {
+				h.logger.Error("TTS 生成失败: " + err.Error())
+			}
+			h.logger.TaskEnd("tts_generate", false)
+			return
+		}
+
+		h.logger.TaskEnd("tts_generate", true)
+	}()
+
+	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+}
+
+func (h *Handlers) findChapterIdxByNum(num int) int {
+	for i, ch := range h.state.Chapters {
+		if ch.Num == num {
+			return i
+		}
+	}
+	return -1
+}
+
+func (h *Handlers) GetMediaTTS(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	chapterStr := r.PathValue("chapter")
+	// For now, return the TTS file path if it exists
+	ttsPath := ttsFilePath(h.projectDir(), 0)
+	_ = ttsPath // placeholder
+	entries, _ := loadTTSIndex(h.projectDir())
+	for _, e := range entries {
+		if fmt.Sprintf("%d", e.Chapter) == chapterStr {
+			h.writeJSON(w, http.StatusOK, e)
+			return
+		}
+	}
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{"status": "not_found"})
+}
+
+func (h *Handlers) GetMediaImagePrepare(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	if h.lastPrepareResult == nil {
+		h.writeJSON(w, http.StatusOK, map[string]string{"status": "none"})
+		return
+	}
+	h.writeJSON(w, http.StatusOK, h.lastPrepareResult)
+}
+
+func (h *Handlers) PostMediaImagePrepare(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	var req ImagePrepareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Intent == "" {
+		h.writeErrorReq(w, r, http.StatusBadRequest, "missing_content")
+		return
+	}
+	if req.Count <= 0 {
+		req.Count = 1
+	}
+
+	settings, _ := loadMediaSettings(h.projectDir())
+	resolution := req.Resolution
+	if resolution == "" {
+		resolution = settings.Image.DefaultResolution
+	}
+
+	projectDir := h.projectDir()
+	apiCfg := h.apiCfg
+	projSettings := h.settings
+	ctx := r.Context()
+
+	if !req.Anima {
+		// Legacy: single LLM call
+		charCtx := buildCharacterContextForLang(projSettings, "", "zh")
+		worldCtx := buildWorldviewContextForLang(projSettings, "", "zh")
+		systemPrompt := "你是一位专业的AI绘画提示词撰写师。根据用户的自然语言描述和项目设定，生成一个详细、结构化的绘画提示词。输出纯JSON: {\"prompt\": \"...\", \"negative_prompt\": \"...\", \"tags\": [...]}。tags含type和name字段，type为character/scene/style之一。"
+		userPrompt := fmt.Sprintf("项目角色设定:\n%s\n\n世界观设定:\n%s\n\n用户意图: %s", charCtx, worldCtx, req.Intent)
+		rawResp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, h.logger)
+		if rawResp == "" {
+			h.writeErrorReq(w, r, http.StatusInternalServerError, "image_prepare_failed", "生成失败")
+			return
+		}
+		rawResp = cleanJSONResponse(rawResp)
+		var result struct {
+			Prompt         string     `json:"prompt"`
+			NegativePrompt string     `json:"negative_prompt"`
+			Tags           []ImageTag `json:"tags"`
+		}
+		if err := json.Unmarshal([]byte(rawResp), &result); err != nil {
+			result.Prompt = req.Intent
+			result.NegativePrompt = "blurry, low quality, deformed"
+		}
+		r := &ImagePrepareResult{
+			Prompt: result.Prompt, NegativePrompt: result.NegativePrompt,
+			Resolution: resolution, Backend: apiCfg.ImageBackend, Tags: result.Tags,
+		}
+		if r.Backend == "" {
+			r.Backend = "openai"
+		}
+		h.lastPrepareResult = r
+		h.logger.Emit("image_prepare_done", r)
+		h.writeJSON(w, http.StatusOK, r)
+		return
+	}
+
+	// Anima Agent workflow
+	batch, err := runImagePrepareAgent(ctx, apiCfg, projectDir, projSettings, req.Intent, resolution, req.Count, h.logger)
+	if err != nil {
+		h.writeErrorReq(w, r, http.StatusInternalServerError, "image_prepare_failed", err.Error())
+		return
+	}
+
+	// Apply defaults
+	for i := range batch.Results {
+		if batch.Results[i].Resolution == "" {
+			batch.Results[i].Resolution = resolution
+		}
+		if batch.Results[i].Backend == "" {
+			if apiCfg.ImageBackend != "" {
+				batch.Results[i].Backend = apiCfg.ImageBackend
+			} else {
+				batch.Results[i].Backend = "openai"
+			}
+		}
+	}
+
+	// Count=1 → return single object for backward compat; count>1 → return batch array
+	if req.Count == 1 && len(batch.Results) == 1 {
+		r := &batch.Results[0]
+		h.lastPrepareResult = r
+		h.logger.Emit("image_prepare_done", r)
+		h.writeJSON(w, http.StatusOK, r)
+	} else {
+		batch.Results = append(batch.Results[:0], batch.Results...)
+		h.logger.Emit("image_prepare_done", batch)
+		h.writeJSON(w, http.StatusOK, batch)
+	}
+}
+
+func (h *Handlers) PostMediaImageGenerate(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	var req struct {
+		Prompts []struct {
+			Prompt         string     `json:"prompt"`
+			NegativePrompt string     `json:"negative_prompt,omitempty"`
+			Resolution     string     `json:"resolution"`
+			Tags           []ImageTag `json:"tags,omitempty"`
+			ChapterNum     int        `json:"chapter_num,omitempty"`
+			Count          int        `json:"count"`
+		} `json:"prompts"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if len(req.Prompts) == 0 {
+		h.writeErrorReq(w, r, http.StatusBadRequest, "missing_content")
+		return
+	}
+
+	if !h.tryStartGenerateTask() {
+		h.writeErrorReq(w, r, http.StatusConflict, "task_running_wait")
+		return
+	}
+
+	projectDir := h.projectDir()
+
+	go func() {
+		defer h.endGenerateTask()
+		h.logger.TaskStart("image_generate")
+		ctx := h.generateCtx
+
+		total := 0
+		for _, p := range req.Prompts {
+			c := p.Count
+			if c <= 0 {
+				c = 1
+			}
+			total += c
+		}
+		done := 0
+		for pi, p := range req.Prompts {
+			resolution := p.Resolution
+			if resolution == "" {
+				resolution = "1024x1024"
+			}
+			c := p.Count
+			if c <= 0 {
+				c = 1
+			}
+			for i := 0; i < c; i++ {
+				select {
+				case <-ctx.Done():
+					h.logger.TaskEnd("image_generate", false)
+					return
+				default:
+				}
+				_, err := generateImage(h.apiCfg, projectDir, p.Prompt, p.NegativePrompt, resolution, p.Tags, p.ChapterNum, h.logger)
+				if err != nil {
+					h.logger.Error("生图失败: " + err.Error())
+				}
+				done++
+				if total > 1 {
+					h.logger.Info(fmt.Sprintf("生图进度: %d/%d", done, total))
+				}
+			}
+			_ = pi
+		}
+
+		h.logger.Emit("image_generate_done", map[string]int{"count": done})
+		h.logger.TaskEnd("image_generate", true)
+	}()
+
+	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+}
+
+func (h *Handlers) PostMediaImageRegenerate(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	record, _, err := findImageByID(h.projectDir(), id)
+	if err != nil || record == nil {
+		h.writeErrorReq(w, r, http.StatusNotFound, "chapter_not_found")
+		return
+	}
+
+	var req struct {
+		Correction string `json:"correction"`
+		Count      int    `json:"count"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeErrorReq(w, r, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if req.Count <= 0 {
+		req.Count = 4
+	}
+	if !h.tryStartTask() {
+		h.writeErrorReq(w, r, http.StatusConflict, "task_running_wait")
+		return
+	}
+
+	mergedPrompt := record.Prompt
+	if req.Correction != "" {
+		mergedPrompt = record.Prompt + "\n\n修正: " + req.Correction
+	}
+	projectDir := h.projectDir()
+
+	go func() {
+		defer h.endTask()
+		h.logger.TaskStart("image_regenerate")
+		ctx := h.taskCtx
+
+		for i := 0; i < req.Count; i++ {
+			select {
+			case <-ctx.Done():
+				h.logger.TaskEnd("image_regenerate", false)
+				return
+			default:
+			}
+
+			_, err := generateImage(h.apiCfg, projectDir, mergedPrompt, record.NegativePrompt, record.Resolution, record.Tags, record.Chapter, h.logger)
+			if err != nil {
+				h.logger.Error("重生成失败: " + err.Error())
+				continue
+			}
+		}
+
+		h.logger.Emit("image_generate_done", map[string]int{"count": req.Count})
+		h.logger.TaskEnd("image_regenerate", true)
+	}()
+
+	h.writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
+}
+
+func (h *Handlers) GetMediaImages(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	records, err := loadImageIndex(h.projectDir())
+	if err != nil {
+		h.writeJSON(w, http.StatusOK, []ImageRecord{})
+		return
+	}
+	h.writeJSON(w, http.StatusOK, records)
+}
+
+func (h *Handlers) GetMediaImageByID(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	record, _, err := findImageByID(h.projectDir(), id)
+	if err != nil || record == nil {
+		h.writeErrorReq(w, r, http.StatusNotFound, "chapter_not_found")
+		return
+	}
+	h.writeJSON(w, http.StatusOK, record)
+}
+
+func (h *Handlers) DeleteMediaImage(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureProject(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	if err := deleteImageRecord(h.projectDir(), id); err != nil {
+		h.writeErrorReq(w, r, http.StatusNotFound, "chapter_not_found")
+		return
+	}
+	h.writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (h *Handlers) GetMediaImageStyles(w http.ResponseWriter, r *http.Request) {
+	h.writeJSON(w, http.StatusOK, availableImageStyles)
+}
+
 func saveAgentSteps(session *ChatSession, steps []AgentStep) {
 	for _, step := range steps {
 		if step.Role == "assistant" {

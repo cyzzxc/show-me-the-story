@@ -174,7 +174,7 @@ Output ONLY the full revised chapter prose.
 		}
 	}
 
-	systemPrompt := SystemPromptFor(lang, "author_default")
+	systemPrompt := SystemPromptFor("", "author_default")
 	var raw string
 	if logger != nil {
 		raw = CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)

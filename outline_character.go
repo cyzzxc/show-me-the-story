@@ -83,7 +83,7 @@ func CheckOutlineCharacterConsistency(ctx context.Context, apiCfg *APIConfig, cf
 		"RegisteredCharacters":  formatRegisteredCharactersForCheck(settings, lang),
 		"AcceptedSummaries":     buildAcceptedSummariesText(state, lang),
 	})
-	systemPrompt := SystemPromptFor(lang, "outline_character_checker_json")
+	systemPrompt := SystemPromptFor("", "outline_character_checker_json")
 
 	rawResp := CallAPIWithRetryLog(ctx, apiCfg, systemPrompt, userPrompt, logger)
 	if rawResp == "" {
@@ -146,4 +146,25 @@ func RunOutlineCharacterCheckAndSave(ctx context.Context, apiCfg *APIConfig, cfg
 func runOutlinePostProcessChecks(ctx context.Context, apiCfg *APIConfig, cfg *Config, state *Progress, settings *ProjectSettings, progressPath string, logger *LogBroadcaster) {
 	RunForeshadowOutlineCheckAndSave(ctx, apiCfg, cfg, state, progressPath, logger)
 	RunOutlineCharacterCheckAndSave(ctx, apiCfg, cfg, state, settings, progressPath, logger)
+}
+
+func RunForeshadowOutlineCheckAndSave(ctx context.Context, apiCfg *APIConfig, cfg *Config, state *Progress, progressPath string, logger *LogBroadcaster) {
+}
+
+func buildFullOutlineText(state *Progress, lang string) string {
+	var sb strings.Builder
+	for _, ch := range state.Chapters {
+		sb.WriteString(fmt.Sprintf("第%d章《%s》: %s\n", ch.Num, ch.Title, ch.Outline))
+	}
+	return sb.String()
+}
+
+func buildAcceptedSummariesText(state *Progress, lang string) string {
+	var sb strings.Builder
+	for _, ch := range state.Chapters {
+		if ch.Status == StatusAccepted && ch.Summary != "" {
+			sb.WriteString(fmt.Sprintf("第%d章《%s》: %s\n", ch.Num, ch.Title, ch.Summary))
+		}
+	}
+	return sb.String()
 }
